@@ -67,6 +67,8 @@ class WalkForwardConfig:
             initial_capital=1000.0,
             stake_per_bet=10.0,
             use_lockup=True,
+            start_date="2025-01-01",  # Optional: start from this date
+            end_date=None,            # Optional: end at this date (None = use all data)
         )
     """
 
@@ -78,6 +80,8 @@ class WalkForwardConfig:
     initial_capital: float = 1000.0  # Starting capital
     stake_per_bet: float = 10.0      # Fixed stake per bet (for sweep)
     use_lockup: bool = True          # Whether to use capital lock-up model
+    start_date: Optional[str] = None  # Start date for walk-forward (None = use min date in data)
+    end_date: Optional[str] = None    # End date for walk-forward (None = use max date in data)
 
     def __post_init__(self):
         """Warn if step_days < out_of_sample_days (overlapping OOS windows)."""
@@ -103,7 +107,7 @@ def run_walk_forward_single(
     Args:
         bets_df: Full bets DataFrame
         strategy: Strategy configuration
-        config: Walk-forward configuration (includes initial_capital, use_lockup)
+        config: Walk-forward configuration (includes initial_capital, use_lockup, start_date, end_date)
 
     Returns:
         Dictionary with:
@@ -113,9 +117,23 @@ def run_walk_forward_single(
             - 'strategy': The strategy configuration
             - 'num_duplicate_bets_removed': Count of duplicates removed from aggregation
     """
-    # Get date range
-    min_date = bets_df["entry_ts"].min()
-    max_date = bets_df["entry_ts"].max()
+    # Get date range - use config dates if provided, else use data bounds
+    data_min_date = bets_df["entry_ts"].min()
+    data_max_date = bets_df["entry_ts"].max()
+    
+    if config.start_date is not None:
+        min_date = pd.to_datetime(config.start_date, utc=True)
+        if min_date < data_min_date:
+            min_date = data_min_date
+    else:
+        min_date = data_min_date
+    
+    if config.end_date is not None:
+        max_date = pd.to_datetime(config.end_date, utc=True)
+        if max_date > data_max_date:
+            max_date = data_max_date
+    else:
+        max_date = data_max_date
 
     window_results = []
     all_oos_bets = []
@@ -277,7 +295,7 @@ def run_walk_forward_sweep(
     Args:
         bets_df: Full bets DataFrame
         param_grid: Parameter grid for sweep
-        config: Walk-forward configuration (includes initial_capital, stake_per_bet, use_lockup)
+        config: Walk-forward configuration (includes initial_capital, stake_per_bet, use_lockup, start_date, end_date)
 
     Returns:
         Dictionary with:
@@ -287,9 +305,23 @@ def run_walk_forward_sweep(
             - 'param_stability': Dict showing how often each param was selected
             - 'num_duplicate_bets_removed': Count of duplicates removed from aggregation
     """
-    # Get date range
-    min_date = bets_df["entry_ts"].min()
-    max_date = bets_df["entry_ts"].max()
+    # Get date range - use config dates if provided, else use data bounds
+    data_min_date = bets_df["entry_ts"].min()
+    data_max_date = bets_df["entry_ts"].max()
+    
+    if config.start_date is not None:
+        min_date = pd.to_datetime(config.start_date, utc=True)
+        if min_date < data_min_date:
+            min_date = data_min_date
+    else:
+        min_date = data_min_date
+    
+    if config.end_date is not None:
+        max_date = pd.to_datetime(config.end_date, utc=True)
+        if max_date > data_max_date:
+            max_date = data_max_date
+    else:
+        max_date = data_max_date
 
     window_results = []
     all_oos_bets = []
