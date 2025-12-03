@@ -78,6 +78,8 @@ def run_parameter_sweep(
                             name += f"_vol{int(config['min_volume']/1000)}k"
                         if "category_include" in config and config["category_include"]:
                             name += f"_cat{len(config['category_include'])}"
+                        if "category_broad_include" in config and config["category_broad_include"]:
+                            name += f"_catb{len(config['category_broad_include'])}"
 
                         strategy = StrategyConfig(
                             name=name,
@@ -129,6 +131,7 @@ def run_longshot_sweep(
     sides: Optional[list[str]] = None,
     volume_thresholds: Optional[list[float]] = None,
     categories: Optional[list[list[str]]] = None,
+    categories_broad: Optional[list[list[str]]] = None,
     initial_capital: float = 1000.0,
     stake_per_bet: float = 1.0,
     verbose: bool = False,
@@ -143,6 +146,7 @@ def run_longshot_sweep(
         sides: List of sides to test (can include "both", "YES", "NO")
         volume_thresholds: List of minimum volume thresholds to test
         categories: List of category lists to test (e.g., [["Sports"], ["Politics"]])
+        categories_broad: List of category_broad lists to test (e.g., [["Sports"], ["Politics"]])
         initial_capital: Starting capital
         stake_per_bet: Fixed stake per bet
         verbose: If True, print detailed progress
@@ -172,6 +176,9 @@ def run_longshot_sweep(
     if categories is None:
         categories = [None]
 
+    if categories_broad is None:
+        categories_broad = [None]
+
     strategies = []
 
     # Generate all combinations
@@ -180,37 +187,42 @@ def run_longshot_sweep(
             for side in sides:
                 for min_vol in volume_thresholds:
                     for cat_list in categories:
-                        # Build strategy name
-                        # Handle "both" in naming
-                        side_str = "both" if side == "both" else side.lower()
-                        name_parts = [
-                            side_str,
-                            f"{int(price_min*100)}-{int(price_max*100)}pct",
-                            horizon,
-                        ]
+                        for cat_broad_list in categories_broad:
+                            # Build strategy name
+                            # Handle "both" in naming
+                            side_str = "both" if side == "both" else side.lower()
+                            name_parts = [
+                                side_str,
+                                f"{int(price_min*100)}-{int(price_max*100)}pct",
+                                horizon,
+                            ]
 
-                        config_kwargs = {}
+                            config_kwargs = {}
 
-                        if min_vol is not None:
-                            name_parts.append(f"vol{int(min_vol/1000)}k")
-                            config_kwargs["min_volume"] = min_vol
+                            if min_vol is not None:
+                                name_parts.append(f"vol{int(min_vol/1000)}k")
+                                config_kwargs["min_volume"] = min_vol
 
-                        if cat_list is not None:
-                            name_parts.append(f"cat{len(cat_list)}")
-                            config_kwargs["category_include"] = cat_list
+                            if cat_list is not None:
+                                name_parts.append(f"cat{len(cat_list)}")
+                                config_kwargs["category_include"] = cat_list
 
-                        name = "_".join(name_parts)
+                            if cat_broad_list is not None:
+                                name_parts.append(f"catb{len(cat_broad_list)}")
+                                config_kwargs["category_broad_include"] = cat_broad_list
 
-                        strategy = StrategyConfig(
-                            name=name,
-                            sides=[side],
-                            horizons=[horizon],
-                            price_min=price_min,
-                            price_max=price_max,
-                            stake_per_bet=stake_per_bet,
-                            **config_kwargs,
-                        )
-                        strategies.append(strategy)
+                            name = "_".join(name_parts)
+
+                            strategy = StrategyConfig(
+                                name=name,
+                                sides=[side],
+                                horizons=[horizon],
+                                price_min=price_min,
+                                price_max=price_max,
+                                stake_per_bet=stake_per_bet,
+                                **config_kwargs,
+                            )
+                            strategies.append(strategy)
 
     print(f"\n{'='*60}")
     print(f"LONGSHOT PARAMETER SWEEP")
@@ -220,6 +232,7 @@ def run_longshot_sweep(
     print(f"Sides: {len(sides)}")
     print(f"Volume thresholds: {len(volume_thresholds)}")
     print(f"Category filters: {len(categories)}")
+    print(f"Category Broad filters: {len(categories_broad)}")
     print(f"Total strategies: {len(strategies)}")
     print(f"{'='*60}\n")
 

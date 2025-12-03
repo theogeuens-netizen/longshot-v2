@@ -31,7 +31,7 @@ class StrategyConfig:
             stake_per_bet=10.0,
         )
 
-        # Or bet on specific side
+        # Or bet on specific side with category filters
         strategy = StrategyConfig(
             name="longshot_no_7d",
             sides=["NO"],
@@ -39,6 +39,7 @@ class StrategyConfig:
             price_min=0.95,
             price_max=0.99,
             category_include=["Grand Prix"],
+            category_broad_include=["Sports"],
             min_volume=3000,
             stake_per_bet=10.0,
         )
@@ -51,6 +52,8 @@ class StrategyConfig:
     price_max: float = 1.0
     category_include: Optional[list[str]] = None
     category_exclude: Optional[list[str]] = None
+    category_broad_include: Optional[list[str]] = None
+    category_broad_exclude: Optional[list[str]] = None
     min_volume: Optional[float] = None
     max_volume: Optional[float] = None
     min_liquidity: Optional[float] = None
@@ -109,6 +112,11 @@ class StrategyConfig:
             desc.append(f"  Categories (include): {', '.join(self.category_include)}")
         if self.category_exclude:
             desc.append(f"  Categories (exclude): {', '.join(self.category_exclude)}")
+
+        if self.category_broad_include:
+            desc.append(f"  Category Broad (include): {', '.join(self.category_broad_include)}")
+        if self.category_broad_exclude:
+            desc.append(f"  Category Broad (exclude): {', '.join(self.category_broad_exclude)}")
 
         if self.min_volume is not None:
             desc.append(f"  Min volume ({self.volume_field}): {self.min_volume:,.0f}")
@@ -182,6 +190,19 @@ def select_bets_for_strategy(
             df = df[~df[strategy.category_field].isin(strategy.category_exclude)]
         else:
             print(f"Warning: category field '{strategy.category_field}' not found in DataFrame")
+
+    # Category broad filters
+    if strategy.category_broad_include is not None:
+        if "category_broad" in df.columns:
+            df = df[df["category_broad"].isin(strategy.category_broad_include)]
+        else:
+            print(f"Warning: column 'category_broad' not found in DataFrame")
+
+    if strategy.category_broad_exclude is not None:
+        if "category_broad" in df.columns:
+            df = df[~df["category_broad"].isin(strategy.category_broad_exclude)]
+        else:
+            print(f"Warning: column 'category_broad' not found in DataFrame")
 
     # Volume filters
     if strategy.min_volume is not None:
