@@ -14,6 +14,7 @@ def run_backtest(
     strategy: StrategyConfig,
     initial_capital: float = 1000.0,
     stake_mode: Literal["fixed"] = "fixed",
+    use_lockup: bool = False,
     verbose: bool = True,
 ) -> dict:
     """
@@ -28,6 +29,7 @@ def run_backtest(
         strategy: Strategy configuration
         initial_capital: Starting capital
         stake_mode: Staking mode ("fixed" for fixed stake per bet)
+        use_lockup: If True, use capital lock-up model (tracks pending bets)
         verbose: If True, print progress and results
 
     Returns:
@@ -36,6 +38,16 @@ def run_backtest(
             - 'metrics': Dictionary of performance metrics
             - 'strategy': The strategy configuration used
     """
+    # Use lockup model if requested
+    if use_lockup:
+        return run_backtest_with_lockup(
+            bets_df=bets_df,
+            strategy=strategy,
+            initial_capital=initial_capital,
+            stake_mode=stake_mode,
+            verbose=verbose,
+        )
+
     if verbose:
         print(f"\n{'='*60}")
         print(f"Running backtest: {strategy.name}")
@@ -116,6 +128,151 @@ def run_backtest(
 
     if verbose:
         print(f"\n{format_metrics(metrics, verbose=True)}")
+
+    return {
+        "capital_series": capital_series,
+        "metrics": metrics,
+        "strategy": strategy,
+    }
+
+
+def run_backtest_with_lockup(
+    bets_df: pd.DataFrame,
+    strategy: StrategyConfig,
+    initial_capital: float = 1000.0,
+    stake_mode: Literal["fixed"] = "fixed",
+    verbose: bool = True,
+) -> dict:
+    """
+    Run a backtest with capital lock-up model.
+
+    This version tracks pending bets (placed but not resolved) and locks capital
+    until resolution. Only allows new bets if available capital is sufficient.
+
+    Args:
+        bets_df: Full bets DataFrame
+        strategy: Strategy configuration
+        initial_capital: Starting capital
+        stake_mode: Staking mode ("fixed" for fixed stake per bet)
+        verbose: If True, print progress and results
+
+    Returns:
+        Dictionary containing:
+            - 'capital_series': DataFrame with capital, available_capital, locked_capital, etc.
+            - 'metrics': Dictionary of performance metrics
+            - 'strategy': The strategy configuration used
+    """
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Running backtest with lockup: {strategy.name}")
+        print(f"{'='*60}")
+
+    # Select bets matching the strategy
+    selected_bets = select_bets_for_strategy(bets_df, strategy)
+
+    if len(selected_bets) == 0:
+        if verbose:
+            print("⚠️  No bets match this strategy")
+        return {
+            "capital_series": pd.DataFrame(),
+            "metrics": {},
+            "strategy": strategy,
+        }
+
+    if verbose:
+        print(f"✓ Selected {len(selected_bets):,} bets matching strategy")
+        print(f"  Date range: {selected_bets['entry_ts'].min()} to {selected_bets['entry_ts'].max()}")
+
+    # Initialize backtest state
+    capital = initial_capital
+    pending_bets = []  # List of dicts: {stake, pnl, resolution_ts, ...}
+    results = []
+
+    # Iterate through bets in chronological order
+    for idx, bet in selected_bets.iterrows():
+        current_time = bet["entry_ts"]
+
+        # Settle any pending bets that have resolved by now
+        still_pending = []
+        for pending in pending_bets:
+            if pending["resolution_ts"] <= current_time:
+                # This bet has resolved - update capital
+                capital += pending["pnl"]
+            else:
+                # Still pending
+                still_pending.append(pending)
+        pending_bets = still_pending
+
+        # Calculate locked and available capital
+        locked_capital = sum(p["stake"] for p in pending_bets)
+        available_capital = capital - locked_capital
+
+        # Determine stake
+        if stake_mode == "fixed":
+            stake = strategy.stake_per_bet
+        else:
+            raise ValueError(f"Unsupported stake_mode: {stake_mode}")
+
+        # Check if we have enough available capital
+        if available_capital < stake:
+            # Insufficient available capital - skip this bet
+            continue
+
+        # Place the bet
+        pnl = stake * bet["roi_per_stake_net"]
+
+        # Add to pending bets
+        pending_bets.append({
+            "stake": stake,
+            "pnl": pnl,
+            "resolution_ts": bet["resolution_ts"],
+        })
+
+        # Record this bet at entry time
+        results.append({
+            "entry_ts": bet["entry_ts"],
+            "resolution_ts": bet["resolution_ts"],
+            "condition_id": bet["condition_id"],
+            "side": bet["side"],
+            "horizon": bet["horizon"],
+            "entry_price": bet["entry_price"],
+            "stake": stake,
+            "realized": bet["realized"],
+            "roi_per_stake_net": bet["roi_per_stake_net"],
+            "pnl": pnl,
+            "capital": capital,
+            "available_capital": available_capital,
+            "locked_capital": locked_capital + stake,  # Include this bet's stake
+            "num_pending_bets": len(pending_bets),
+            "strategy_name": strategy.name,
+        })
+
+    # Settle any remaining pending bets at the end
+    for pending in pending_bets:
+        capital += pending["pnl"]
+
+    # Create capital series DataFrame
+    if len(results) == 0:
+        if verbose:
+            print("⚠️  No bets were placed (insufficient capital or all filtered out)")
+        return {
+            "capital_series": pd.DataFrame(),
+            "metrics": {},
+            "strategy": strategy,
+        }
+
+    capital_series = pd.DataFrame(results)
+
+    # Calculate metrics
+    metrics = calculate_metrics(capital_series, initial_capital)
+
+    if verbose:
+        print(f"\n{format_metrics(metrics, verbose=True)}")
+        print(f"\n💼 CAPITAL LOCKUP STATS")
+        print(f"  Max Locked:         ${capital_series['locked_capital'].max():>10,.2f}")
+        print(f"  Avg Locked:         ${capital_series['locked_capital'].mean():>10,.2f}")
+        print(f"  Max Pending Bets:   {capital_series['num_pending_bets'].max():>10,}")
+        print(f"  Avg Pending Bets:   {capital_series['num_pending_bets'].mean():>10.1f}")
 
     return {
         "capital_series": capital_series,

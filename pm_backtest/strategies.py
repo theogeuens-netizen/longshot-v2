@@ -31,7 +31,7 @@ class StrategyConfig:
             stake_per_bet=10.0,
         )
 
-        # Or bet on specific side
+        # Or bet on specific side with category filters
         strategy = StrategyConfig(
             name="longshot_no_7d",
             sides=["NO"],
@@ -39,6 +39,7 @@ class StrategyConfig:
             price_min=0.95,
             price_max=0.99,
             category_include=["Grand Prix"],
+            category_broad_include=["Sports"],
             min_volume=3000,
             stake_per_bet=10.0,
         )
@@ -51,6 +52,8 @@ class StrategyConfig:
     price_max: float = 1.0
     category_include: Optional[list[str]] = None
     category_exclude: Optional[list[str]] = None
+    category_broad_include: Optional[list[str]] = None
+    category_broad_exclude: Optional[list[str]] = None
     min_volume: Optional[float] = None
     max_volume: Optional[float] = None
     min_liquidity: Optional[float] = None
@@ -62,6 +65,10 @@ class StrategyConfig:
     volume_field: str = "volumeNum"  # Which volume column to use
     liquidity_field: str = "liquidityNum"  # Which liquidity column to use
     category_field: str = "category_1"  # Which category column to use
+
+    # Date filtering
+    start_date: Optional[str] = None  # e.g., "2024-01-01" - filter by entry_ts >= start_date
+    end_date: Optional[str] = None    # e.g., "2024-12-31" - filter by entry_ts <= end_date
 
     def __post_init__(self):
         """Validate strategy configuration."""
@@ -106,6 +113,11 @@ class StrategyConfig:
         if self.category_exclude:
             desc.append(f"  Categories (exclude): {', '.join(self.category_exclude)}")
 
+        if self.category_broad_include:
+            desc.append(f"  Category Broad (include): {', '.join(self.category_broad_include)}")
+        if self.category_broad_exclude:
+            desc.append(f"  Category Broad (exclude): {', '.join(self.category_broad_exclude)}")
+
         if self.min_volume is not None:
             desc.append(f"  Min volume ({self.volume_field}): {self.min_volume:,.0f}")
         if self.max_volume is not None:
@@ -118,6 +130,11 @@ class StrategyConfig:
 
         if self.max_bets_per_day is not None:
             desc.append(f"  Max bets per day: {self.max_bets_per_day}")
+
+        if self.start_date is not None:
+            desc.append(f"  Start date: {self.start_date}")
+        if self.end_date is not None:
+            desc.append(f"  End date: {self.end_date}")
 
         desc.append(f"  Stake per bet: ${self.stake_per_bet:.2f}")
 
@@ -152,6 +169,15 @@ def select_bets_for_strategy(
     # Filter by price range
     df = df[(df["entry_price"] >= strategy.price_min) & (df["entry_price"] <= strategy.price_max)]
 
+    # Date filters
+    if strategy.start_date is not None:
+        start_ts = pd.to_datetime(strategy.start_date, utc=True)
+        df = df[df["entry_ts"] >= start_ts]
+
+    if strategy.end_date is not None:
+        end_ts = pd.to_datetime(strategy.end_date, utc=True)
+        df = df[df["entry_ts"] <= end_ts]
+
     # Category filters
     if strategy.category_include is not None:
         if strategy.category_field in df.columns:
@@ -164,6 +190,19 @@ def select_bets_for_strategy(
             df = df[~df[strategy.category_field].isin(strategy.category_exclude)]
         else:
             print(f"Warning: category field '{strategy.category_field}' not found in DataFrame")
+
+    # Category broad filters
+    if strategy.category_broad_include is not None:
+        if "category_broad" in df.columns:
+            df = df[df["category_broad"].isin(strategy.category_broad_include)]
+        else:
+            print(f"Warning: column 'category_broad' not found in DataFrame")
+
+    if strategy.category_broad_exclude is not None:
+        if "category_broad" in df.columns:
+            df = df[~df["category_broad"].isin(strategy.category_broad_exclude)]
+        else:
+            print(f"Warning: column 'category_broad' not found in DataFrame")
 
     # Volume filters
     if strategy.min_volume is not None:
