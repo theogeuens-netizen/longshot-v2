@@ -7,6 +7,41 @@ import numpy as np
 from typing import Optional
 
 
+def calculate_sharpe_per_bet(capital_series: pd.DataFrame) -> float:
+    """
+    Calculate Sharpe ratio based on per-bet ROI, annualized by bets/year.
+
+    This approach avoids inflation from resampling when bets are sparse.
+
+    Args:
+        capital_series: DataFrame with 'roi_per_stake_net' and 'entry_ts' columns
+
+    Returns:
+        Annualized Sharpe ratio based on bet returns
+    """
+    if "roi_per_stake_net" not in capital_series.columns:
+        return 0.0
+
+    bet_returns = capital_series["roi_per_stake_net"]
+
+    if len(bet_returns) < 2 or bet_returns.std() == 0:
+        return 0.0
+
+    # Sharpe per bet
+    sharpe_per_bet = bet_returns.mean() / bet_returns.std()
+
+    # Annualize by bets per year
+    if "entry_ts" in capital_series.columns or "timestamp" in capital_series.columns:
+        ts_col = "entry_ts" if "entry_ts" in capital_series.columns else "timestamp"
+        total_days = (capital_series[ts_col].max() - capital_series[ts_col].min()).total_seconds() / 86400
+
+        if total_days > 0:
+            bets_per_year = len(capital_series) / (total_days / 365.25)
+            return sharpe_per_bet * np.sqrt(bets_per_year)
+
+    return sharpe_per_bet
+
+
 def calculate_metrics(
     capital_series: pd.DataFrame,
     initial_capital: float,
@@ -57,20 +92,8 @@ def calculate_metrics(
     max_drawdown = df["drawdown"].min()
     max_drawdown_pct = max_drawdown * 100
 
-    # Resample to calculate periodic returns for Sharpe ratio
-    df_resampled = df.set_index("timestamp").resample(freq).last().ffill()
-    df_resampled["returns"] = df_resampled["capital"].pct_change()
-
-    # Sharpe ratio (assuming 0 risk-free rate for simplicity)
-    returns = df_resampled["returns"].dropna()
-    if len(returns) > 1 and returns.std() > 0:
-        # Annualize based on frequency
-        periods_per_year = {"D": 252, "W": 52, "M": 12}.get(freq, 252)
-        sharpe_ratio = (
-            returns.mean() / returns.std() * np.sqrt(periods_per_year)
-        )
-    else:
-        sharpe_ratio = 0
+    # Sharpe ratio (per-bet approach, avoids resampling inflation)
+    sharpe_ratio = calculate_sharpe_per_bet(df)
 
     # Bet-level statistics
     num_bets = len(df)
@@ -107,6 +130,19 @@ def calculate_metrics(
         avg_stake = None
         total_staked = None
 
+    # Calmar ratio (annualized return / abs(max drawdown))
+    if max_drawdown != 0:
+        calmar_ratio = annualized_return / abs(max_drawdown)
+    else:
+        calmar_ratio = 0
+
+    # Composite score: balances return, risk, and consistency
+    # High return + high win rate + low drawdown = good
+    if win_rate is not None:
+        composite_score = (total_return_pct * win_rate) / (1 + abs(max_drawdown_pct) / 100)
+    else:
+        composite_score = 0
+
     # Compile metrics
     metrics = {
         # Return metrics
@@ -118,6 +154,8 @@ def calculate_metrics(
         "max_drawdown": max_drawdown,
         "max_drawdown_pct": max_drawdown_pct,
         "sharpe_ratio": sharpe_ratio,
+        "calmar_ratio": calmar_ratio,
+        "composite_score": composite_score,
         # Capital metrics
         "initial_capital": initial_capital,
         "final_capital": final_capital,
@@ -152,6 +190,8 @@ def _empty_metrics() -> dict:
         "max_drawdown": 0,
         "max_drawdown_pct": 0,
         "sharpe_ratio": 0,
+        "calmar_ratio": 0,
+        "composite_score": 0,
         "initial_capital": 0,
         "final_capital": 0,
         "total_pnl": 0,
@@ -193,9 +233,11 @@ def format_metrics(metrics: dict, verbose: bool = True) -> str:
     lines.append(f"  Annualized Return:  {metrics['annualized_return_pct']:>10.2f}%")
 
     # Risk metrics
-    lines.append("\n📉 RISK")
+    lines.append("\n📉 RISK & QUALITY")
     lines.append(f"  Max Drawdown:       {metrics['max_drawdown_pct']:>10.2f}%")
     lines.append(f"  Sharpe Ratio:       {metrics['sharpe_ratio']:>10.2f}")
+    lines.append(f"  Calmar Ratio:       {metrics['calmar_ratio']:>10.2f}")
+    lines.append(f"  Composite Score:    {metrics['composite_score']:>10.2f}")
 
     # Capital
     lines.append("\n💰 CAPITAL")

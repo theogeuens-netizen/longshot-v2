@@ -63,6 +63,10 @@ class StrategyConfig:
     liquidity_field: str = "liquidityNum"  # Which liquidity column to use
     category_field: str = "category_1"  # Which category column to use
 
+    # Date filtering
+    start_date: Optional[str] = None  # e.g., "2024-01-01" - filter by entry_ts >= start_date
+    end_date: Optional[str] = None    # e.g., "2024-12-31" - filter by entry_ts <= end_date
+
     def __post_init__(self):
         """Validate strategy configuration."""
         if not self.name:
@@ -119,6 +123,11 @@ class StrategyConfig:
         if self.max_bets_per_day is not None:
             desc.append(f"  Max bets per day: {self.max_bets_per_day}")
 
+        if self.start_date is not None:
+            desc.append(f"  Start date: {self.start_date}")
+        if self.end_date is not None:
+            desc.append(f"  End date: {self.end_date}")
+
         desc.append(f"  Stake per bet: ${self.stake_per_bet:.2f}")
 
         return "\n".join(desc)
@@ -151,6 +160,15 @@ def select_bets_for_strategy(
 
     # Filter by price range
     df = df[(df["entry_price"] >= strategy.price_min) & (df["entry_price"] <= strategy.price_max)]
+
+    # Date filters
+    if strategy.start_date is not None:
+        start_ts = pd.to_datetime(strategy.start_date, utc=True)
+        df = df[df["entry_ts"] >= start_ts]
+
+    if strategy.end_date is not None:
+        end_ts = pd.to_datetime(strategy.end_date, utc=True)
+        df = df[df["entry_ts"] <= end_ts]
 
     # Category filters
     if strategy.category_include is not None:
