@@ -67,8 +67,10 @@ def run_parameter_sweep(
             for price_min, price_max in price_ranges:
                 for horizon in horizons:
                     for side in sides:
+                        # Handle "both" in naming
+                        side_str = "both" if side == "both" else side.lower()
                         name = (
-                            f"{side.lower()}_{int(price_min*100)}-{int(price_max*100)}pct_{horizon}"
+                            f"{side_str}_{int(price_min*100)}-{int(price_max*100)}pct_{horizon}"
                         )
 
                         # Add descriptive suffix for filters
@@ -138,7 +140,7 @@ def run_longshot_sweep(
         bets_df: Full bets DataFrame
         price_buckets: List of (price_min, price_max) tuples to test
         horizons: List of horizons to test
-        sides: List of sides to test
+        sides: List of sides to test (can include "both", "YES", "NO")
         volume_thresholds: List of minimum volume thresholds to test
         categories: List of category lists to test (e.g., [["Sports"], ["Politics"]])
         initial_capital: Starting capital
@@ -179,8 +181,10 @@ def run_longshot_sweep(
                 for min_vol in volume_thresholds:
                     for cat_list in categories:
                         # Build strategy name
+                        # Handle "both" in naming
+                        side_str = "both" if side == "both" else side.lower()
                         name_parts = [
-                            side.lower(),
+                            side_str,
                             f"{int(price_min*100)}-{int(price_max*100)}pct",
                             horizon,
                         ]

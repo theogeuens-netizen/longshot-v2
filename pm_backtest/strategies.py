@@ -13,13 +13,25 @@ class StrategyConfig:
     Configuration for a prediction market betting strategy.
 
     A strategy defines which bets to take based on:
-    - Side (YES/NO)
+    - Side (YES/NO/both)
     - Time horizon before resolution
     - Price range (entry_price)
     - Market metadata filters (category, volume, liquidity, etc.)
     - Position sizing (stake per bet)
 
     Example:
+        # Bet on longshots on both sides
+        strategy = StrategyConfig(
+            name="longshot_both_7d",
+            sides=["both"],  # Accepts YES or NO bets in price range
+            horizons=["7d"],
+            price_min=0.01,
+            price_max=0.05,
+            min_volume=3000,
+            stake_per_bet=10.0,
+        )
+
+        # Or bet on specific side
         strategy = StrategyConfig(
             name="longshot_no_7d",
             sides=["NO"],
@@ -59,10 +71,16 @@ class StrategyConfig:
         if not self.sides:
             raise ValueError("Must specify at least one side")
 
+        # Handle "both" as a special case - expand to ["YES", "NO"]
+        if "both" in self.sides:
+            if len(self.sides) > 1:
+                raise ValueError("Cannot mix 'both' with other side specifications")
+            self.sides = ["YES", "NO"]
+
         valid_sides = {"YES", "NO"}
         for side in self.sides:
             if side not in valid_sides:
-                raise ValueError(f"Invalid side: {side}. Must be 'YES' or 'NO'")
+                raise ValueError(f"Invalid side: {side}. Must be 'YES', 'NO', or 'both'")
 
         if not self.horizons:
             raise ValueError("Must specify at least one horizon")
@@ -202,7 +220,7 @@ def create_longshot_strategies(
     Args:
         price_buckets: List of (price_min, price_max) tuples
         horizons: List of horizons to test
-        sides: List of sides to test (default: ["YES", "NO"])
+        sides: List of sides to test (default: ["YES", "NO"]) - can include "both"
         stake_per_bet: Fixed stake per bet
         **kwargs: Additional strategy parameters (category_include, min_volume, etc.)
 
@@ -210,8 +228,17 @@ def create_longshot_strategies(
         List of StrategyConfig objects
 
     Example:
+        # Create strategies for both sides
         strategies = create_longshot_strategies(
-            price_buckets=[(0.01, 0.05), (0.05, 0.10), (0.90, 0.95), (0.95, 0.99)],
+            price_buckets=[(0.01, 0.05), (0.05, 0.10)],
+            horizons=["7d", "14d"],
+            sides=["both"],
+            min_volume=3000,
+        )
+
+        # Or create for specific sides
+        strategies = create_longshot_strategies(
+            price_buckets=[(0.90, 0.95), (0.95, 0.99)],
             horizons=["7d", "14d"],
             sides=["NO"],
             min_volume=3000,
@@ -226,7 +253,9 @@ def create_longshot_strategies(
     for price_min, price_max in price_buckets:
         for horizon in horizons:
             for side in sides:
-                name = f"{side.lower()}_{int(price_min*100)}-{int(price_max*100)}pct_{horizon}"
+                # Handle "both" in naming
+                side_str = "both" if side == "both" else side.lower()
+                name = f"{side_str}_{int(price_min*100)}-{int(price_max*100)}pct_{horizon}"
 
                 strategy = StrategyConfig(
                     name=name,

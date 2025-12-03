@@ -101,7 +101,17 @@ print("="*80)
 
 # Define several strategies to compare
 strategies = [
-    # Extreme longshots (1-5%)
+    # Longshots on BOTH sides (1-5%)
+    StrategyConfig(
+        name="both_1-5_7d",
+        sides=["both"],  # Bet on longshots regardless of YES/NO
+        horizons=["7d"],
+        price_min=0.01,
+        price_max=0.05,
+        min_volume=1000,
+        stake_per_bet=10.0,
+    ),
+    # Extreme longshots (YES only, 1-5%)
     StrategyConfig(
         name="yes_1-5_7d",
         sides=["YES"],
@@ -111,7 +121,7 @@ strategies = [
         min_volume=1000,
         stake_per_bet=10.0,
     ),
-    # Reverse longshots (95-99%)
+    # Reverse longshots (NO only, 95-99%)
     StrategyConfig(
         name="no_95-99_7d",
         sides=["NO"],
