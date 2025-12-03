@@ -5,6 +5,7 @@ Walk-forward analysis tests strategy robustness across time windows
 without forward-looking bias.
 """
 
+import warnings
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
@@ -13,6 +14,37 @@ from .strategies import StrategyConfig, select_bets_for_strategy
 from .backtest import run_backtest
 from .sweep import run_parameter_sweep
 from .metrics import calculate_metrics
+
+
+def _get_bet_key(row: pd.Series) -> tuple:
+    """Generate a unique key for a bet to detect duplicates."""
+    return (row["condition_id"], row["entry_ts"], row["side"], row["horizon"])
+
+
+def _filter_duplicate_bets(
+    oos_capital_series: pd.DataFrame,
+    seen_bets: set,
+) -> pd.DataFrame:
+    """
+    Filter out bets that have already been seen in previous windows.
+    
+    Args:
+        oos_capital_series: Capital series from current OOS window
+        seen_bets: Set of bet keys already included
+        
+    Returns:
+        Filtered DataFrame with only new bets
+    """
+    if len(oos_capital_series) == 0:
+        return oos_capital_series
+    
+    # Identify which bets are new
+    new_mask = []
+    for _, row in oos_capital_series.iterrows():
+        key = _get_bet_key(row)
+        new_mask.append(key not in seen_bets)
+    
+    return oos_capital_series[new_mask].copy()
 
 
 @dataclass
@@ -47,6 +79,15 @@ class WalkForwardConfig:
     stake_per_bet: float = 10.0      # Fixed stake per bet (for sweep)
     use_lockup: bool = True          # Whether to use capital lock-up model
 
+    def __post_init__(self):
+        """Warn if step_days < out_of_sample_days (overlapping OOS windows)."""
+        if self.step_days < self.out_of_sample_days:
+            warnings.warn(
+                f"step_days ({self.step_days}) < out_of_sample_days ({self.out_of_sample_days}): "
+                f"OOS windows will overlap. Duplicate bets will be de-duplicated in aggregated metrics.",
+                UserWarning,
+            )
+
 
 def run_walk_forward_single(
     bets_df: pd.DataFrame,
@@ -68,8 +109,9 @@ def run_walk_forward_single(
         Dictionary with:
             - 'window_results': List of per-window metrics
             - 'aggregated_oos_metrics': Combined out-of-sample performance
-            - 'aggregated_oos_capital_series': Combined capital series
+            - 'aggregated_oos_capital_series': Combined capital series (de-duplicated)
             - 'strategy': The strategy configuration
+            - 'num_duplicate_bets_removed': Count of duplicates removed from aggregation
     """
     # Get date range
     min_date = bets_df["entry_ts"].min()
@@ -77,6 +119,8 @@ def run_walk_forward_single(
 
     window_results = []
     all_oos_bets = []
+    seen_bets = set()  # Track bets already included in aggregation
+    num_duplicates_removed = 0
     capital = config.initial_capital
 
     # Generate windows
@@ -136,7 +180,18 @@ def run_walk_forward_single(
         # Update capital for next window
         if len(oos_capital_series) > 0:
             capital = oos_capital_series["capital"].iloc[-1]
-            all_oos_bets.append(oos_capital_series)
+            
+            # De-duplicate before adding to aggregated results
+            original_count = len(oos_capital_series)
+            new_bets_only = _filter_duplicate_bets(oos_capital_series, seen_bets)
+            num_duplicates_removed += original_count - len(new_bets_only)
+            
+            # Add new bet keys to seen set
+            for _, row in new_bets_only.iterrows():
+                seen_bets.add(_get_bet_key(row))
+            
+            if len(new_bets_only) > 0:
+                all_oos_bets.append(new_bets_only)
 
         # Record window results
         window_results.append({
@@ -163,6 +218,10 @@ def run_walk_forward_single(
     # Aggregate out-of-sample results
     if len(all_oos_bets) > 0:
         aggregated_oos_capital_series = pd.concat(all_oos_bets, ignore_index=True)
+        # Re-sort by entry_ts and recalculate capital series
+        aggregated_oos_capital_series = _recalculate_capital_series(
+            aggregated_oos_capital_series, config.initial_capital
+        )
         aggregated_oos_metrics = calculate_metrics(aggregated_oos_capital_series, config.initial_capital)
     else:
         aggregated_oos_capital_series = pd.DataFrame()
@@ -173,7 +232,30 @@ def run_walk_forward_single(
         "aggregated_oos_metrics": aggregated_oos_metrics,
         "aggregated_oos_capital_series": aggregated_oos_capital_series,
         "strategy": strategy,
+        "num_duplicate_bets_removed": num_duplicates_removed,
     }
+
+
+def _recalculate_capital_series(
+    capital_series: pd.DataFrame,
+    initial_capital: float,
+) -> pd.DataFrame:
+    """
+    Re-sort and recalculate capital after de-duplication.
+    
+    Since we removed duplicate bets, we need to:
+    1. Sort by entry_ts
+    2. Recalculate running capital based on PnL
+    """
+    if len(capital_series) == 0:
+        return capital_series
+    
+    df = capital_series.sort_values("entry_ts").reset_index(drop=True)
+    
+    # Recalculate capital from PnL
+    df["capital"] = initial_capital + df["pnl"].cumsum()
+    
+    return df
 
 
 def run_walk_forward_sweep(
@@ -200,9 +282,10 @@ def run_walk_forward_sweep(
     Returns:
         Dictionary with:
             - 'window_results': List with best_params and oos metrics per window
-            - 'aggregated_oos_metrics': Realistic combined performance
-            - 'aggregated_oos_capital_series': Realistic equity curve
+            - 'aggregated_oos_metrics': Realistic combined performance (de-duplicated)
+            - 'aggregated_oos_capital_series': Realistic equity curve (de-duplicated)
             - 'param_stability': Dict showing how often each param was selected
+            - 'num_duplicate_bets_removed': Count of duplicates removed from aggregation
     """
     # Get date range
     min_date = bets_df["entry_ts"].min()
@@ -211,6 +294,8 @@ def run_walk_forward_sweep(
     window_results = []
     all_oos_bets = []
     param_selections = []
+    seen_bets = set()  # Track bets already included in aggregation
+    num_duplicates_removed = 0
     capital = config.initial_capital
 
     # Generate windows
@@ -301,7 +386,18 @@ def run_walk_forward_sweep(
         # Update capital for next window
         if len(oos_capital_series) > 0:
             capital = oos_capital_series["capital"].iloc[-1]
-            all_oos_bets.append(oos_capital_series)
+            
+            # De-duplicate before adding to aggregated results
+            original_count = len(oos_capital_series)
+            new_bets_only = _filter_duplicate_bets(oos_capital_series, seen_bets)
+            num_duplicates_removed += original_count - len(new_bets_only)
+            
+            # Add new bet keys to seen set
+            for _, row in new_bets_only.iterrows():
+                seen_bets.add(_get_bet_key(row))
+            
+            if len(new_bets_only) > 0:
+                all_oos_bets.append(new_bets_only)
 
         # Record window results
         window_results.append({
@@ -329,6 +425,10 @@ def run_walk_forward_sweep(
     # Aggregate out-of-sample results
     if len(all_oos_bets) > 0:
         aggregated_oos_capital_series = pd.concat(all_oos_bets, ignore_index=True)
+        # Re-sort by entry_ts and recalculate capital series
+        aggregated_oos_capital_series = _recalculate_capital_series(
+            aggregated_oos_capital_series, config.initial_capital
+        )
         aggregated_oos_metrics = calculate_metrics(aggregated_oos_capital_series, config.initial_capital)
     else:
         aggregated_oos_capital_series = pd.DataFrame()
@@ -342,6 +442,7 @@ def run_walk_forward_sweep(
         "aggregated_oos_metrics": aggregated_oos_metrics,
         "aggregated_oos_capital_series": aggregated_oos_capital_series,
         "param_stability": param_stability,
+        "num_duplicate_bets_removed": num_duplicates_removed,
     }
 
 
@@ -393,6 +494,7 @@ def analyze_walk_forward(results: dict) -> None:
     - In-sample vs out-of-sample degradation
     - Parameter stability (for sweep results)
     - Aggregated out-of-sample metrics
+    - De-duplication stats
 
     Args:
         results: Dictionary from run_walk_forward_single or run_walk_forward_sweep
@@ -400,6 +502,7 @@ def analyze_walk_forward(results: dict) -> None:
     window_results = results.get("window_results", [])
     aggregated_metrics = results.get("aggregated_oos_metrics", {})
     param_stability = results.get("param_stability", {})
+    num_duplicates = results.get("num_duplicate_bets_removed", 0)
 
     if len(window_results) == 0:
         print("No walk-forward windows were completed")
@@ -410,6 +513,10 @@ def analyze_walk_forward(results: dict) -> None:
     print(f"{'='*80}\n")
 
     print(f"Total Windows: {len(window_results)}")
+    
+    # Show de-duplication info if relevant
+    if num_duplicates > 0:
+        print(f"⚠️  Duplicate bets removed from aggregation: {num_duplicates}")
 
     # Convert to DataFrame for easier analysis
     df = pd.DataFrame(window_results)
