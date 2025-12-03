@@ -101,6 +101,8 @@ wf_config = WalkForwardConfig(
     step_days=30,           # Advance 30 days for next window
     optimization_metric="composite_score",
     min_bets=15,
+    initial_capital=1000.0,
+    use_lockup=True,
 )
 
 print(f"\nWalk-Forward Configuration:")
@@ -115,8 +117,6 @@ wf_result = run_walk_forward_single(
     bets_df=bets_df,
     strategy=strategy,
     config=wf_config,
-    initial_capital=1000.0,
-    use_lockup=True,
 )
 
 # Analyze results
@@ -154,9 +154,6 @@ wf_sweep_result = run_walk_forward_sweep(
     bets_df=bets_df,
     param_grid=param_grid,
     config=wf_config,
-    initial_capital=1000.0,
-    stake_per_bet=10.0,
-    use_lockup=True,
 )
 
 # Analyze sweep results
@@ -203,15 +200,15 @@ for metric in optimization_metrics:
         step_days=30,
         optimization_metric=metric,
         min_bets=15,
+        initial_capital=1000.0,
+        stake_per_bet=10.0,
+        use_lockup=True,
     )
 
     result = run_walk_forward_sweep(
         bets_df=bets_df,
         param_grid=param_grid,
         config=config,
-        initial_capital=1000.0,
-        stake_per_bet=10.0,
-        use_lockup=True,
     )
 
     metric_results[metric] = result["aggregated_oos_metrics"]

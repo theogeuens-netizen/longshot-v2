@@ -235,9 +235,13 @@ def format_metrics(metrics: dict, verbose: bool = True) -> str:
     # Risk metrics
     lines.append("\n📉 RISK & QUALITY")
     lines.append(f"  Max Drawdown:       {metrics['max_drawdown_pct']:>10.2f}%")
+    lines.append(f"      → Worst peak-to-trough loss during backtest")
     lines.append(f"  Sharpe Ratio:       {metrics['sharpe_ratio']:>10.2f}")
+    lines.append(f"      → Risk-adjusted return (higher is better, >1 is good)")
     lines.append(f"  Calmar Ratio:       {metrics['calmar_ratio']:>10.2f}")
+    lines.append(f"      → Annual return divided by max drawdown")
     lines.append(f"  Composite Score:    {metrics['composite_score']:>10.2f}")
+    lines.append(f"      → Balanced metric: (return × win_rate) / (1 + |drawdown|)")
 
     # Capital
     lines.append("\n💰 CAPITAL")

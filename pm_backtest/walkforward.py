@@ -32,6 +32,9 @@ class WalkForwardConfig:
             step_days=30,           # Advance 30 days for next window
             optimization_metric="composite_score",
             min_bets=15,
+            initial_capital=1000.0,
+            stake_per_bet=10.0,
+            use_lockup=True,
         )
     """
 
@@ -40,14 +43,15 @@ class WalkForwardConfig:
     step_days: int = 30
     optimization_metric: str = "composite_score"  # or "calmar_ratio", "sharpe_ratio", "total_return_pct"
     min_bets: int = 15  # Minimum bets required in in-sample for valid optimization
+    initial_capital: float = 1000.0  # Starting capital
+    stake_per_bet: float = 10.0      # Fixed stake per bet (for sweep)
+    use_lockup: bool = True          # Whether to use capital lock-up model
 
 
 def run_walk_forward_single(
     bets_df: pd.DataFrame,
     strategy: StrategyConfig,
     config: WalkForwardConfig,
-    initial_capital: float = 1000.0,
-    use_lockup: bool = True,
 ) -> dict:
     """
     Walk-forward test for a SINGLE strategy.
@@ -58,9 +62,7 @@ def run_walk_forward_single(
     Args:
         bets_df: Full bets DataFrame
         strategy: Strategy configuration
-        config: Walk-forward configuration
-        initial_capital: Starting capital
-        use_lockup: Whether to use capital lock-up model
+        config: Walk-forward configuration (includes initial_capital, use_lockup)
 
     Returns:
         Dictionary with:
@@ -75,7 +77,7 @@ def run_walk_forward_single(
 
     window_results = []
     all_oos_bets = []
-    capital = initial_capital
+    capital = config.initial_capital
 
     # Generate windows
     current_start = min_date
@@ -107,7 +109,7 @@ def run_walk_forward_single(
             is_data,
             strategy,
             initial_capital=capital,
-            use_lockup=use_lockup,
+            use_lockup=config.use_lockup,
             verbose=False,
         )
 
@@ -124,7 +126,7 @@ def run_walk_forward_single(
             oos_data,
             strategy,
             initial_capital=capital,
-            use_lockup=use_lockup,
+            use_lockup=config.use_lockup,
             verbose=False,
         )
 
@@ -161,7 +163,7 @@ def run_walk_forward_single(
     # Aggregate out-of-sample results
     if len(all_oos_bets) > 0:
         aggregated_oos_capital_series = pd.concat(all_oos_bets, ignore_index=True)
-        aggregated_oos_metrics = calculate_metrics(aggregated_oos_capital_series, initial_capital)
+        aggregated_oos_metrics = calculate_metrics(aggregated_oos_capital_series, config.initial_capital)
     else:
         aggregated_oos_capital_series = pd.DataFrame()
         aggregated_oos_metrics = {}
@@ -178,9 +180,6 @@ def run_walk_forward_sweep(
     bets_df: pd.DataFrame,
     param_grid: dict,
     config: WalkForwardConfig,
-    initial_capital: float = 1000.0,
-    stake_per_bet: float = 10.0,
-    use_lockup: bool = True,
 ) -> dict:
     """
     Walk-forward with parameter optimization.
@@ -196,10 +195,7 @@ def run_walk_forward_sweep(
     Args:
         bets_df: Full bets DataFrame
         param_grid: Parameter grid for sweep
-        config: Walk-forward configuration
-        initial_capital: Starting capital
-        stake_per_bet: Fixed stake per bet
-        use_lockup: Whether to use capital lock-up model
+        config: Walk-forward configuration (includes initial_capital, stake_per_bet, use_lockup)
 
     Returns:
         Dictionary with:
@@ -215,7 +211,7 @@ def run_walk_forward_sweep(
     window_results = []
     all_oos_bets = []
     param_selections = []
-    capital = initial_capital
+    capital = config.initial_capital
 
     # Generate windows
     current_start = min_date
@@ -244,7 +240,7 @@ def run_walk_forward_sweep(
 
         # Run parameter sweep on in-sample
         # Modify param_grid to include stake_per_bet
-        base_config = {"stake_per_bet": stake_per_bet}
+        base_config = {"stake_per_bet": config.stake_per_bet}
 
         sweep_results = run_parameter_sweep(
             is_data,
@@ -295,7 +291,7 @@ def run_walk_forward_sweep(
             oos_data,
             best_strategy,
             initial_capital=capital,
-            use_lockup=use_lockup,
+            use_lockup=config.use_lockup,
             verbose=False,
         )
 
@@ -333,7 +329,7 @@ def run_walk_forward_sweep(
     # Aggregate out-of-sample results
     if len(all_oos_bets) > 0:
         aggregated_oos_capital_series = pd.concat(all_oos_bets, ignore_index=True)
-        aggregated_oos_metrics = calculate_metrics(aggregated_oos_capital_series, initial_capital)
+        aggregated_oos_metrics = calculate_metrics(aggregated_oos_capital_series, config.initial_capital)
     else:
         aggregated_oos_capital_series = pd.DataFrame()
         aggregated_oos_metrics = {}
