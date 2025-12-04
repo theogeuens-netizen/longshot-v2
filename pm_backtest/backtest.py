@@ -300,6 +300,29 @@ def run_backtest_with_lockup(
     }
 
 
+# =============================================================================
+# Worker Pool with Shared DataFrame (avoids pickling DataFrame per task)
+# =============================================================================
+
+# Global variable for worker processes - initialized once per worker
+_worker_bets_df = None
+_worker_initial_capital = None
+_worker_stake_mode = None
+
+
+def _init_worker(bets_df: pd.DataFrame, initial_capital: float, stake_mode: str):
+    """
+    Initializer for worker processes.
+    
+    Called ONCE per worker when the pool starts. The DataFrame is pickled
+    only once per worker, not once per task. This is the key optimization.
+    """
+    global _worker_bets_df, _worker_initial_capital, _worker_stake_mode
+    _worker_bets_df = bets_df
+    _worker_initial_capital = initial_capital
+    _worker_stake_mode = stake_mode
+
+
 def _strategy_to_dict(strategy: StrategyConfig) -> dict:
     """Convert StrategyConfig to a plain dict for pickling."""
     return {
@@ -352,29 +375,31 @@ def _dict_to_strategy(d: dict) -> StrategyConfig:
     )
 
 
-def _run_single_backtest_worker(args: tuple) -> Optional[dict]:
+def _run_single_backtest_worker(strategy_dict: dict) -> Optional[dict]:
     """
     Worker function for parallel backtest execution.
     
+    Uses global _worker_bets_df initialized by _init_worker().
+    Only the strategy_dict is passed per task (small, fast to pickle).
+    
     Args:
-        args: Tuple of (bets_df, strategy_dict, initial_capital, stake_mode)
-              Note: strategy_dict is a plain dict, not StrategyConfig (for pickling)
+        strategy_dict: Plain dict representation of StrategyConfig
         
     Returns:
         Dictionary with strategy results, or None if no results
     """
-    bets_df, strategy_dict, initial_capital, stake_mode = args
+    global _worker_bets_df, _worker_initial_capital, _worker_stake_mode
     
     try:
-        # Reconstruct StrategyConfig from dict in worker process
+        # Reconstruct StrategyConfig from dict
         strategy = _dict_to_strategy(strategy_dict)
         
         backtest_result = run_backtest(
-            bets_df,
+            _worker_bets_df,
             strategy,
-            initial_capital=initial_capital,
-            stake_mode=stake_mode,
-            verbose=False,  # Always silent in parallel mode
+            initial_capital=_worker_initial_capital,
+            stake_mode=_worker_stake_mode,
+            verbose=False,
         )
         
         metrics = backtest_result["metrics"]
@@ -395,7 +420,6 @@ def _run_single_backtest_worker(args: tuple) -> Optional[dict]:
                 **metrics,
             }
     except Exception as e:
-        # Log error but don't crash the whole sweep
         print(f"⚠️  Error in strategy {strategy_dict.get('name', '?')}: {e}")
     
     return None
@@ -433,6 +457,8 @@ def run_multiple_backtests(
     start_index = 0
 
     # Determine number of workers
+    # Determine number of workers
+    # For ProcessPoolExecutor with initializer, use CPU count for optimal parallelism
     if n_jobs == -1:
         n_workers = mp.cpu_count()
     elif n_jobs <= 0:
@@ -440,8 +466,8 @@ def run_multiple_backtests(
     else:
         n_workers = n_jobs
     
-    # Disable parallel for small sweeps or if explicitly disabled
-    if len(strategies) < 10 or not use_parallel or n_workers == 1:
+    # Disable parallel for very small sweeps (overhead not worth it)
+    if len(strategies) < 20 or not use_parallel or n_workers == 1:
         use_parallel = False
         n_workers = 1
 
@@ -600,37 +626,45 @@ def _run_parallel_backtests(
     start_index: int,
     total_strategies: int,
 ) -> List[dict]:
-    """Run backtests in parallel with progress bar and checkpointing."""
+    """
+    Run backtests in parallel using ProcessPoolExecutor with initializer.
+    
+    Key optimization: The DataFrame is passed via initializer, so it's pickled
+    only ONCE per worker process (not once per task). With 8 workers and 6,480
+    strategies, this means 8 pickle operations instead of 6,480.
+    
+    This gives true parallelism (bypasses GIL) with minimal serialization overhead.
+    """
     results = existing_results.copy()
     
-    # Convert strategies to dicts to avoid pickle issues in notebooks
-    # This is necessary because ProcessPoolExecutor pickles objects to send to workers,
-    # and dataclasses can have issues when modules are reloaded in Jupyter/Colab
-    work_args = [
-        (bets_df, _strategy_to_dict(strategy), initial_capital, stake_mode)
-        for strategy in strategies
-    ]
+    # Convert strategies to dicts (small, fast to pickle - sent per task)
+    strategy_dicts = [_strategy_to_dict(s) for s in strategies]
 
     # Progress bar
     pbar = tqdm(
         total=len(strategies),
-        desc="Backtesting (parallel)",
+        desc=f"Backtesting ({n_workers} workers)",
         unit="strat",
         ncols=100,
     ) if TQDM_AVAILABLE else None
 
     completed = 0
     
-    # Use ProcessPoolExecutor for true parallelism
-    # Note: ThreadPoolExecutor won't help due to GIL for CPU-bound work
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        # Submit all tasks
+    # ProcessPoolExecutor with initializer pattern:
+    # - initializer runs once per worker when pool starts
+    # - DataFrame pickled only N_WORKERS times (not N_TASKS times)
+    # - Each task only sends the small strategy_dict
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_init_worker,
+        initargs=(bets_df, initial_capital, stake_mode),
+    ) as executor:
+        # Submit all tasks - only strategy_dict sent per task
         future_to_idx = {
-            executor.submit(_run_single_backtest_worker, args): i
-            for i, args in enumerate(work_args)
+            executor.submit(_run_single_backtest_worker, sd): i
+            for i, sd in enumerate(strategy_dicts)
         }
         
-        # Collect results as they complete
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
             actual_index = start_index + completed
