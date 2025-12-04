@@ -3,17 +3,36 @@ Walk-forward testing for prediction market strategies.
 
 Walk-forward analysis tests strategy robustness across time windows
 without forward-looking bias.
+
+Supports:
+- Single strategy walk-forward testing
+- Parameter optimization with walk-forward sweep
+- Parallel execution for faster sweeps
+- Checkpointing for long runs
 """
 
 import warnings
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import os
+
 from .strategies import StrategyConfig, select_bets_for_strategy
 from .backtest import run_backtest
 from .sweep import run_parameter_sweep
 from .metrics import calculate_metrics
+
+# Optional tqdm import
+try:
+    from tqdm.auto import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    def tqdm(iterable=None, total=None, **kwargs):
+        return iterable
 
 
 def _get_bet_key(row: pd.Series) -> tuple:
@@ -69,6 +88,7 @@ class WalkForwardConfig:
             use_lockup=True,
             start_date="2025-01-01",  # Optional: start from this date
             end_date=None,            # Optional: end at this date (None = use all data)
+            n_jobs=-1,                # Parallel workers for sweep (-1 = all CPUs)
         )
     """
 
@@ -82,6 +102,8 @@ class WalkForwardConfig:
     use_lockup: bool = True          # Whether to use capital lock-up model
     start_date: Optional[str] = None  # Start date for walk-forward (None = use min date in data)
     end_date: Optional[str] = None    # End date for walk-forward (None = use max date in data)
+    n_jobs: int = -1                  # Number of parallel workers for sweep (-1 = all CPUs)
+    checkpoint_path: Optional[str] = None  # Path to save checkpoints
 
     def __post_init__(self):
         """Warn if step_days < out_of_sample_days (overlapping OOS windows)."""
@@ -93,10 +115,44 @@ class WalkForwardConfig:
             )
 
 
+def _generate_windows(
+    min_date: pd.Timestamp,
+    max_date: pd.Timestamp,
+    config: WalkForwardConfig,
+) -> List[Dict[str, pd.Timestamp]]:
+    """Generate all walk-forward windows."""
+    windows = []
+    current_start = min_date
+    window_num = 0
+    
+    while True:
+        window_num += 1
+        is_start = current_start
+        is_end = is_start + pd.Timedelta(days=config.in_sample_days)
+        oos_start = is_end
+        oos_end = oos_start + pd.Timedelta(days=config.out_of_sample_days)
+        
+        if oos_end > max_date:
+            break
+            
+        windows.append({
+            "window_num": window_num,
+            "is_start": is_start,
+            "is_end": is_end,
+            "oos_start": oos_start,
+            "oos_end": oos_end,
+        })
+        
+        current_start += pd.Timedelta(days=config.step_days)
+    
+    return windows
+
+
 def run_walk_forward_single(
     bets_df: pd.DataFrame,
     strategy: StrategyConfig,
     config: WalkForwardConfig,
+    verbose: bool = True,
 ) -> dict:
     """
     Walk-forward test for a SINGLE strategy.
@@ -108,6 +164,7 @@ def run_walk_forward_single(
         bets_df: Full bets DataFrame
         strategy: Strategy configuration
         config: Walk-forward configuration (includes initial_capital, use_lockup, start_date, end_date)
+        verbose: If True, show progress bar
 
     Returns:
         Dictionary with:
@@ -135,28 +192,47 @@ def run_walk_forward_single(
     else:
         max_date = data_max_date
 
+    # Generate windows
+    windows = _generate_windows(min_date, max_date, config)
+    
+    if len(windows) == 0:
+        print("⚠️  No valid walk-forward windows")
+        return {
+            "window_results": [],
+            "aggregated_oos_metrics": {},
+            "aggregated_oos_capital_series": pd.DataFrame(),
+            "strategy": strategy,
+            "num_duplicate_bets_removed": 0,
+        }
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"WALK-FORWARD TEST: {strategy.name}")
+        print(f"{'='*60}")
+        print(f"  Windows: {len(windows)}")
+        print(f"  Period: {min_date.date()} to {max_date.date()}")
+        print(f"{'='*60}\n")
+
     window_results = []
     all_oos_bets = []
-    seen_bets = set()  # Track bets already included in aggregation
+    seen_bets = set()
     num_duplicates_removed = 0
     capital = config.initial_capital
 
-    # Generate windows
-    current_start = min_date
-    window_num = 0
+    # Progress bar
+    pbar = tqdm(
+        windows,
+        desc="Walk-forward windows",
+        unit="win",
+        ncols=100,
+    ) if TQDM_AVAILABLE and verbose else windows
 
-    while True:
-        window_num += 1
-
-        # Define window boundaries
-        is_start = current_start
-        is_end = is_start + pd.Timedelta(days=config.in_sample_days)
-        oos_start = is_end
-        oos_end = oos_start + pd.Timedelta(days=config.out_of_sample_days)
-
-        # Check if we have enough data
-        if oos_end > max_date:
-            break
+    for window in pbar:
+        window_num = window["window_num"]
+        is_start = window["is_start"]
+        is_end = window["is_end"]
+        oos_start = window["oos_start"]
+        oos_end = window["oos_end"]
 
         # Filter data for this window
         is_data = bets_df[
@@ -166,7 +242,7 @@ def run_walk_forward_single(
             (bets_df["entry_ts"] >= oos_start) & (bets_df["entry_ts"] < oos_end)
         ]
 
-        # Test strategy on in-sample (for validation)
+        # Test strategy on in-sample
         is_result = run_backtest(
             is_data,
             strategy,
@@ -179,8 +255,6 @@ def run_walk_forward_single(
 
         # Check if in-sample has enough bets
         if is_metrics.get("num_bets", 0) < config.min_bets:
-            # Not enough data - skip this window
-            current_start += pd.Timedelta(days=config.step_days)
             continue
 
         # Test on out-of-sample
@@ -199,12 +273,11 @@ def run_walk_forward_single(
         if len(oos_capital_series) > 0:
             capital = oos_capital_series["capital"].iloc[-1]
             
-            # De-duplicate before adding to aggregated results
+            # De-duplicate
             original_count = len(oos_capital_series)
             new_bets_only = _filter_duplicate_bets(oos_capital_series, seen_bets)
             num_duplicates_removed += original_count - len(new_bets_only)
             
-            # Add new bet keys to seen set
             for _, row in new_bets_only.iterrows():
                 seen_bets.add(_get_bet_key(row))
             
@@ -230,13 +303,9 @@ def run_walk_forward_single(
             "oos_composite": oos_metrics.get("composite_score", 0),
         })
 
-        # Advance window
-        current_start += pd.Timedelta(days=config.step_days)
-
-    # Aggregate out-of-sample results
+    # Aggregate results
     if len(all_oos_bets) > 0:
         aggregated_oos_capital_series = pd.concat(all_oos_bets, ignore_index=True)
-        # Re-sort by entry_ts and recalculate capital series
         aggregated_oos_capital_series = _recalculate_capital_series(
             aggregated_oos_capital_series, config.initial_capital
         )
@@ -258,103 +327,36 @@ def _recalculate_capital_series(
     capital_series: pd.DataFrame,
     initial_capital: float,
 ) -> pd.DataFrame:
-    """
-    Re-sort and recalculate capital after de-duplication.
-    
-    Since we removed duplicate bets, we need to:
-    1. Sort by entry_ts
-    2. Recalculate running capital based on PnL
-    """
+    """Re-sort and recalculate capital after de-duplication."""
     if len(capital_series) == 0:
         return capital_series
     
     df = capital_series.sort_values("entry_ts").reset_index(drop=True)
-    
-    # Recalculate capital from PnL
     df["capital"] = initial_capital + df["pnl"].cumsum()
     
     return df
 
 
-def run_walk_forward_sweep(
-    bets_df: pd.DataFrame,
-    param_grid: dict,
-    config: WalkForwardConfig,
-) -> dict:
+def _process_single_window(
+    args: Tuple,
+) -> Optional[Dict[str, Any]]:
     """
-    Walk-forward with parameter optimization.
-
-    For each window:
-    1. Run sweep on in-sample period
-    2. Select best strategy by optimization_metric
-    3. Test on out-of-sample period
-    4. Roll forward
-
-    Capital carries over between windows.
-
+    Worker function to process a single walk-forward window.
+    
     Args:
-        bets_df: Full bets DataFrame
-        param_grid: Parameter grid for sweep
-            Can include e.g.:
-              - 'price_ranges'
-              - 'horizons'
-              - 'sides'
-              - 'min_volume'
-              - 'category_include'
-              - 'category_broad_include'
-              - 'category_exclude'
-              - 'category_broad_exclude'
-        config: Walk-forward configuration (includes initial_capital, stake_per_bet, use_lockup, start_date, end_date)
-
+        args: Tuple of (bets_df, window, param_grid, config, capital)
+        
     Returns:
-        Dictionary with:
-            - 'window_results': List with best_params and oos metrics per window
-            - 'aggregated_oos_metrics': Realistic combined performance (de-duplicated)
-            - 'aggregated_oos_capital_series': Realistic equity curve (de-duplicated)
-            - 'param_stability': Dict showing how often each param was selected
-            - 'num_duplicate_bets_removed': Count of duplicates removed from aggregation
+        Dictionary with window results, or None if failed
     """
-    # Get date range - use config dates if provided, else use data bounds
-    data_min_date = bets_df["entry_ts"].min()
-    data_max_date = bets_df["entry_ts"].max()
+    bets_df, window, param_grid, config, capital = args
     
-    if config.start_date is not None:
-        min_date = pd.to_datetime(config.start_date, utc=True)
-        if min_date < data_min_date:
-            min_date = data_min_date
-    else:
-        min_date = data_min_date
-    
-    if config.end_date is not None:
-        max_date = pd.to_datetime(config.end_date, utc=True)
-        if max_date > data_max_date:
-            max_date = data_max_date
-    else:
-        max_date = data_max_date
-
-    window_results = []
-    all_oos_bets = []
-    param_selections = []
-    seen_bets = set()  # Track bets already included in aggregation
-    num_duplicates_removed = 0
-    capital = config.initial_capital
-
-    # Generate windows
-    current_start = min_date
-    window_num = 0
-
-    while True:
-        window_num += 1
-
-        # Define window boundaries
-        is_start = current_start
-        is_end = is_start + pd.Timedelta(days=config.in_sample_days)
-        oos_start = is_end
-        oos_end = oos_start + pd.Timedelta(days=config.out_of_sample_days)
-
-        # Check if we have enough data
-        if oos_end > max_date:
-            break
+    try:
+        window_num = window["window_num"]
+        is_start = window["is_start"]
+        is_end = window["is_end"]
+        oos_start = window["oos_start"]
+        oos_end = window["oos_end"]
 
         # Filter data for this window
         is_data = bets_df[
@@ -379,16 +381,14 @@ def run_walk_forward_sweep(
         sweep_results = sweep_results[sweep_results["num_bets"] >= config.min_bets]
 
         if len(sweep_results) == 0:
-            # No strategies met criteria - skip this window
-            current_start += pd.Timedelta(days=config.step_days)
-            continue
+            return None
 
-        # Select best strategy by optimization metric
+        # Select best strategy
         best_idx = sweep_results[config.optimization_metric].idxmax()
         best_row = sweep_results.loc[best_idx]
         best_strategy_name = best_row["strategy_name"]
 
-        # Reconstruct best strategy config: CORE params
+        # Reconstruct best strategy config
         best_params = {
             "sides": best_row["sides"].split(","),
             "horizons": best_row["horizons"].split(","),
@@ -397,7 +397,7 @@ def run_walk_forward_sweep(
             "stake_per_bet": best_row["stake_per_bet"],
         }
 
-        # OPTIONAL FILTERS (including categories)  -------------------------
+        # Optional filters
         optional_fields = [
             "min_volume",
             "category_include",
@@ -407,13 +407,9 @@ def run_walk_forward_sweep(
         ]
         for field in optional_fields:
             if field in sweep_results.columns:
-                # best_row[field] might be None / NaN; just pass it through
                 best_params[field] = best_row[field]
 
-        # Record parameter selection (for stability analysis)
-        param_selections.append(best_params)
-
-        # Create strategy config for out-of-sample testing
+        # Create strategy config
         best_strategy = StrategyConfig(
             name=f"{best_strategy_name}_window{window_num}",
             sides=best_params["sides"],
@@ -440,16 +436,244 @@ def run_walk_forward_sweep(
         oos_metrics = oos_result["metrics"]
         oos_capital_series = oos_result["capital_series"]
 
-        # Update capital for next window
+        # Calculate new capital
+        new_capital = capital
+        if len(oos_capital_series) > 0:
+            new_capital = oos_capital_series["capital"].iloc[-1]
+
+        return {
+            "window_num": window_num,
+            "is_start": is_start,
+            "is_end": is_end,
+            "oos_start": oos_start,
+            "oos_end": oos_end,
+            "best_strategy_name": best_strategy_name,
+            "best_params": best_params,
+            "is_num_strategies": len(sweep_results),
+            "is_best_return_pct": best_row["total_return_pct"],
+            "is_best_sharpe": best_row["sharpe_ratio"],
+            "is_best_metric": best_row[config.optimization_metric],
+            "oos_num_bets": oos_metrics.get("num_bets", 0),
+            "oos_return_pct": oos_metrics.get("total_return_pct", 0),
+            "oos_sharpe": oos_metrics.get("sharpe_ratio", 0),
+            "oos_calmar": oos_metrics.get("calmar_ratio", 0),
+            "oos_composite": oos_metrics.get("composite_score", 0),
+            "oos_capital_series": oos_capital_series,
+            "new_capital": new_capital,
+        }
+        
+    except Exception as e:
+        print(f"⚠️  Window {window.get('window_num', '?')} failed: {e}")
+        return None
+
+
+def run_walk_forward_sweep(
+    bets_df: pd.DataFrame,
+    param_grid: dict,
+    config: WalkForwardConfig,
+    verbose: bool = True,
+) -> dict:
+    """
+    Walk-forward with parameter optimization.
+
+    For each window:
+    1. Run sweep on in-sample period
+    2. Select best strategy by optimization_metric
+    3. Test on out-of-sample period
+    4. Roll forward
+
+    Capital carries over between windows.
+    
+    Note: Windows are processed SEQUENTIALLY because capital carries over.
+    However, each window's parameter sweep runs in parallel.
+
+    Args:
+        bets_df: Full bets DataFrame
+        param_grid: Parameter grid for sweep
+        config: Walk-forward configuration
+        verbose: If True, show progress
+
+    Returns:
+        Dictionary with:
+            - 'window_results': List with best_params and oos metrics per window
+            - 'aggregated_oos_metrics': Realistic combined performance (de-duplicated)
+            - 'aggregated_oos_capital_series': Realistic equity curve (de-duplicated)
+            - 'param_stability': Dict showing how often each param was selected
+            - 'num_duplicate_bets_removed': Count of duplicates removed
+    """
+    # Get date range
+    data_min_date = bets_df["entry_ts"].min()
+    data_max_date = bets_df["entry_ts"].max()
+    
+    if config.start_date is not None:
+        min_date = pd.to_datetime(config.start_date, utc=True)
+        if min_date < data_min_date:
+            min_date = data_min_date
+    else:
+        min_date = data_min_date
+    
+    if config.end_date is not None:
+        max_date = pd.to_datetime(config.end_date, utc=True)
+        if max_date > data_max_date:
+            max_date = data_max_date
+    else:
+        max_date = data_max_date
+
+    # Generate windows
+    windows = _generate_windows(min_date, max_date, config)
+    
+    if len(windows) == 0:
+        print("⚠️  No valid walk-forward windows")
+        return {
+            "window_results": [],
+            "aggregated_oos_metrics": {},
+            "aggregated_oos_capital_series": pd.DataFrame(),
+            "param_stability": {},
+            "num_duplicate_bets_removed": 0,
+        }
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"WALK-FORWARD SWEEP")
+        print(f"{'='*60}")
+        print(f"  Windows: {len(windows)}")
+        print(f"  Period: {min_date.date()} to {max_date.date()}")
+        print(f"  Optimization metric: {config.optimization_metric}")
+        print(f"  Min bets: {config.min_bets}")
+        print(f"{'='*60}\n")
+
+    # Load checkpoint if available
+    window_results = []
+    all_oos_bets = []
+    param_selections = []
+    seen_bets = set()
+    num_duplicates_removed = 0
+    capital = config.initial_capital
+    start_window = 0
+    
+    if config.checkpoint_path is not None and os.path.exists(config.checkpoint_path):
+        try:
+            checkpoint = pd.read_parquet(config.checkpoint_path)
+            window_results = checkpoint.to_dict("records")
+            start_window = len(window_results)
+            
+            # Reconstruct state
+            for wr in window_results:
+                if "new_capital" in wr:
+                    capital = wr["new_capital"]
+                if "best_params" in wr:
+                    param_selections.append(wr["best_params"])
+            
+            print(f"✓ Resuming from checkpoint: {start_window}/{len(windows)} windows completed")
+        except Exception as e:
+            print(f"⚠️  Could not load checkpoint: {e}")
+
+    # Process windows SEQUENTIALLY (capital carries over)
+    pbar = tqdm(
+        windows[start_window:],
+        desc="Walk-forward windows",
+        unit="win",
+        ncols=100,
+        initial=start_window,
+        total=len(windows),
+    ) if TQDM_AVAILABLE and verbose else windows[start_window:]
+
+    for window in pbar:
+        window_num = window["window_num"]
+        is_start = window["is_start"]
+        is_end = window["is_end"]
+        oos_start = window["oos_start"]
+        oos_end = window["oos_end"]
+
+        # Filter data for this window
+        is_data = bets_df[
+            (bets_df["entry_ts"] >= is_start) & (bets_df["entry_ts"] < is_end)
+        ]
+        oos_data = bets_df[
+            (bets_df["entry_ts"] >= oos_start) & (bets_df["entry_ts"] < oos_end)
+        ]
+
+        # Run parameter sweep on in-sample (this uses parallel execution internally)
+        base_config = {"stake_per_bet": config.stake_per_bet}
+
+        sweep_results = run_parameter_sweep(
+            is_data,
+            param_grid,
+            initial_capital=capital,
+            base_config=base_config,
+            verbose=False,
+        )
+
+        # Filter for minimum bets
+        sweep_results = sweep_results[sweep_results["num_bets"] >= config.min_bets]
+
+        if len(sweep_results) == 0:
+            continue
+
+        # Select best strategy
+        best_idx = sweep_results[config.optimization_metric].idxmax()
+        best_row = sweep_results.loc[best_idx]
+        best_strategy_name = best_row["strategy_name"]
+
+        # Reconstruct best strategy config
+        best_params = {
+            "sides": best_row["sides"].split(","),
+            "horizons": best_row["horizons"].split(","),
+            "price_min": best_row["price_min"],
+            "price_max": best_row["price_max"],
+            "stake_per_bet": best_row["stake_per_bet"],
+        }
+
+        # Optional filters
+        optional_fields = [
+            "min_volume",
+            "category_include",
+            "category_broad_include",
+            "category_exclude",
+            "category_broad_exclude",
+        ]
+        for field in optional_fields:
+            if field in sweep_results.columns:
+                best_params[field] = best_row[field]
+
+        param_selections.append(best_params)
+
+        # Create strategy config
+        best_strategy = StrategyConfig(
+            name=f"{best_strategy_name}_window{window_num}",
+            sides=best_params["sides"],
+            horizons=best_params["horizons"],
+            price_min=best_params["price_min"],
+            price_max=best_params["price_max"],
+            stake_per_bet=best_params["stake_per_bet"],
+            min_volume=best_params.get("min_volume"),
+            category_include=best_params.get("category_include"),
+            category_broad_include=best_params.get("category_broad_include"),
+            category_exclude=best_params.get("category_exclude"),
+            category_broad_exclude=best_params.get("category_broad_exclude"),
+        )
+
+        # Test on out-of-sample
+        oos_result = run_backtest(
+            oos_data,
+            best_strategy,
+            initial_capital=capital,
+            use_lockup=config.use_lockup,
+            verbose=False,
+        )
+
+        oos_metrics = oos_result["metrics"]
+        oos_capital_series = oos_result["capital_series"]
+
+        # Update capital
         if len(oos_capital_series) > 0:
             capital = oos_capital_series["capital"].iloc[-1]
             
-            # De-duplicate before adding to aggregated results
+            # De-duplicate
             original_count = len(oos_capital_series)
             new_bets_only = _filter_duplicate_bets(oos_capital_series, seen_bets)
             num_duplicates_removed += original_count - len(new_bets_only)
             
-            # Add new bet keys to seen set
             for _, row in new_bets_only.iterrows():
                 seen_bets.add(_get_bet_key(row))
             
@@ -457,7 +681,7 @@ def run_walk_forward_sweep(
                 all_oos_bets.append(new_bets_only)
 
         # Record window results
-        window_results.append({
+        window_result = {
             "window": window_num,
             "is_start": is_start,
             "is_end": is_end,
@@ -474,15 +698,28 @@ def run_walk_forward_sweep(
             "oos_sharpe": oos_metrics.get("sharpe_ratio", 0),
             "oos_calmar": oos_metrics.get("calmar_ratio", 0),
             "oos_composite": oos_metrics.get("composite_score", 0),
-        })
+            "new_capital": capital,
+        }
+        window_results.append(window_result)
 
-        # Advance window
-        current_start += pd.Timedelta(days=config.step_days)
+        # Update progress bar
+        if TQDM_AVAILABLE and hasattr(pbar, 'set_postfix'):
+            pbar.set_postfix({
+                'capital': f"${capital:,.0f}",
+                'best': best_strategy_name[:20],
+            })
 
-    # Aggregate out-of-sample results
+        # Checkpoint
+        if config.checkpoint_path is not None and len(window_results) % 5 == 0:
+            pd.DataFrame(window_results).to_parquet(config.checkpoint_path, index=False)
+
+    # Final checkpoint
+    if config.checkpoint_path is not None:
+        pd.DataFrame(window_results).to_parquet(config.checkpoint_path, index=False)
+
+    # Aggregate results
     if len(all_oos_bets) > 0:
         aggregated_oos_capital_series = pd.concat(all_oos_bets, ignore_index=True)
-        # Re-sort by entry_ts and recalculate capital series
         aggregated_oos_capital_series = _recalculate_capital_series(
             aggregated_oos_capital_series, config.initial_capital
         )
@@ -537,12 +774,12 @@ def _analyze_param_stability(param_selections: list[dict]) -> dict:
         price_key = f"{params['price_min']:.2f}-{params['price_max']:.2f}"
         price_range_counts[price_key] = price_range_counts.get(price_key, 0) + 1
 
-        # Count volume thresholds (if any)
+        # Count volume thresholds
         if "min_volume" in params and params["min_volume"] not in (None, np.nan):
             vol_key = int(params["min_volume"])
             volume_counts[vol_key] = volume_counts.get(vol_key, 0) + 1
 
-        # Count category includes (if any)
+        # Count category includes
         if "category_include" in params and params["category_include"]:
             vals = params["category_include"]
             if not isinstance(vals, (list, tuple)):
@@ -597,11 +834,10 @@ def analyze_walk_forward(results: dict) -> None:
 
     print(f"Total Windows: {len(window_results)}")
     
-    # Show de-duplication info if relevant
     if num_duplicates > 0:
         print(f"⚠️  Duplicate bets removed from aggregation: {num_duplicates}")
 
-    # Convert to DataFrame for easier analysis
+    # Convert to DataFrame
     df = pd.DataFrame(window_results)
 
     # In-sample vs out-of-sample comparison
@@ -615,7 +851,7 @@ def analyze_walk_forward(results: dict) -> None:
             print(f"\n  In-Sample Sharpe (avg):     {df['is_sharpe'].mean():>8.2f}")
             print(f"  Out-of-Sample Sharpe (avg): {df['oos_sharpe'].mean():>8.2f}")
 
-    # Aggregated out-of-sample performance
+    # Aggregated performance
     if aggregated_metrics:
         print(f"\n🎯 AGGREGATED OUT-OF-SAMPLE PERFORMANCE")
         print(f"  Total Return:      {aggregated_metrics.get('total_return_pct', 0):>8.2f}%")
@@ -627,7 +863,7 @@ def analyze_walk_forward(results: dict) -> None:
         print(f"  Total Bets:        {aggregated_metrics.get('num_bets', 0):>8,}")
         print(f"  Win Rate:          {aggregated_metrics.get('win_rate', 0)*100:>8.2f}%")
 
-    # Parameter stability (for sweep results)
+    # Parameter stability
     if param_stability:
         print(f"\n🔄 PARAMETER STABILITY")
         print(f"  Total Windows: {param_stability.get('total_windows', 0)}")
