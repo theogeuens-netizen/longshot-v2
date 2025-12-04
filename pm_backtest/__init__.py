@@ -14,7 +14,12 @@ from .backtest import (
     compare_strategies,
 )
 from .metrics import calculate_metrics, calculate_sharpe_per_bet
-from .sweep import run_parameter_sweep, filter_sweep_results, analyze_sweep_results
+from .sweep import (
+    run_parameter_sweep,
+    run_longshot_sweep,
+    filter_sweep_results,
+    analyze_sweep_results,
+)
 from .walkforward import (
     WalkForwardConfig,
     run_walk_forward_single,
@@ -68,6 +73,7 @@ __all__ = [
     "calculate_sharpe_per_bet",
     # Sweep
     "run_parameter_sweep",
+    "run_longshot_sweep",
     "filter_sweep_results",
     "analyze_sweep_results",
     # Walk-forward
