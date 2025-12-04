@@ -627,42 +627,61 @@ def _run_parallel_backtests(
     total_strategies: int,
 ) -> List[dict]:
     """
-    Run backtests in parallel using ProcessPoolExecutor with initializer.
+    Run backtests in parallel using ThreadPoolExecutor.
     
-    Key optimization: The DataFrame is passed via initializer, so it's pickled
-    only ONCE per worker process (not once per task). With 8 workers and 6,480
-    strategies, this means 8 pickle operations instead of 6,480.
-    
-    This gives true parallelism (bypasses GIL) with minimal serialization overhead.
+    We use ThreadPoolExecutor instead of ProcessPoolExecutor because:
+    - ProcessPoolExecutor hangs in Jupyter/Colab environments
+    - ThreadPoolExecutor shares memory (no pickle overhead)
+    - Pandas releases the GIL for most operations, so we still get parallelism
     """
-    results = existing_results.copy()
+    from concurrent.futures import ThreadPoolExecutor
     
-    # Convert strategies to dicts (small, fast to pickle - sent per task)
-    strategy_dicts = [_strategy_to_dict(s) for s in strategies]
+    results = existing_results.copy()
 
     # Progress bar
     pbar = tqdm(
         total=len(strategies),
-        desc=f"Backtesting ({n_workers} workers)",
+        desc=f"Backtesting ({n_workers} threads)",
         unit="strat",
         ncols=100,
     ) if TQDM_AVAILABLE else None
 
     completed = 0
     
-    # ProcessPoolExecutor with initializer pattern:
-    # - initializer runs once per worker when pool starts
-    # - DataFrame pickled only N_WORKERS times (not N_TASKS times)
-    # - Each task only sends the small strategy_dict
-    with ProcessPoolExecutor(
-        max_workers=n_workers,
-        initializer=_init_worker,
-        initargs=(bets_df, initial_capital, stake_mode),
-    ) as executor:
-        # Submit all tasks - only strategy_dict sent per task
+    def run_single(strategy: StrategyConfig) -> Optional[dict]:
+        """Run a single backtest."""
+        try:
+            result = run_backtest(
+                bets_df,
+                strategy,
+                initial_capital=initial_capital,
+                stake_mode=stake_mode,
+                verbose=False,
+            )
+            
+            metrics = result["metrics"]
+            if metrics:
+                return {
+                    "strategy_name": strategy.name,
+                    "sides": ",".join(strategy.sides),
+                    "horizons": ",".join(strategy.horizons),
+                    "price_min": strategy.price_min,
+                    "price_max": strategy.price_max,
+                    "stake_per_bet": strategy.stake_per_bet,
+                    "min_volume": strategy.min_volume,
+                    "category_include": strategy.category_include,
+                    "category_broad_include": strategy.category_broad_include,
+                    "category_exclude": strategy.category_exclude,
+                    "category_broad_exclude": strategy.category_broad_exclude,
+                    **metrics,
+                }
+        except Exception as e:
+            print(f"⚠️  Error in {strategy.name}: {e}")
+        return None
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
         future_to_idx = {
-            executor.submit(_run_single_backtest_worker, sd): i
-            for i, sd in enumerate(strategy_dicts)
+            executor.submit(run_single, s): i for i, s in enumerate(strategies)
         }
         
         for future in as_completed(future_to_idx):
@@ -670,7 +689,7 @@ def _run_parallel_backtests(
             actual_index = start_index + completed
             
             try:
-                result = future.result()
+                result = future.result(timeout=60)  # 60s timeout per strategy
                 if result is not None:
                     results.append(result)
             except Exception as e:
@@ -678,7 +697,6 @@ def _run_parallel_backtests(
             
             completed += 1
             
-            # Update progress bar
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix({
@@ -686,7 +704,7 @@ def _run_parallel_backtests(
                     'results': len(results),
                 })
             
-            # Checkpoint periodically
+            # Checkpoint
             if checkpoint_path is not None and completed % checkpoint_every == 0:
                 pd.DataFrame(results).to_parquet(checkpoint_path, index=False)
 
