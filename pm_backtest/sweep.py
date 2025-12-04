@@ -9,6 +9,49 @@ from .strategies import StrategyConfig, create_longshot_strategies
 from .backtest import run_multiple_backtests
 
 
+# ----------------------------------------------------------------------
+# Helpers for naming
+# ----------------------------------------------------------------------
+
+def _slugify(value: str) -> str:
+    """Simple slugifier for category names used in strategy_name."""
+    if value is None:
+        return ""
+    v = str(value).strip().lower()
+    # basic replacements
+    v = v.replace("&", "and").replace("+", "plus").replace("/", "-").replace(" ", "-")
+    # keep only a–z, 0–9, '-' and '_'
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+    return "".join(ch for ch in v if ch in allowed)
+
+
+def _format_cat_suffix(tag: str, cats: list[Any], max_items: int = 3) -> str:
+    """
+    Build a compact suffix like:
+      _cat_sports-politics
+      _catb_macro-crypto+2more
+    """
+    if not cats:
+        return ""
+    slugs = [_slugify(c) for c in cats if c]
+    slugs = [s for s in slugs if s]
+
+    if not slugs:
+        return ""
+
+    if len(slugs) <= max_items:
+        body = "-".join(slugs)
+    else:
+        head = "-".join(slugs[:max_items])
+        body = f"{head}+{len(slugs) - max_items}more"
+
+    return f"_{tag}_{body}"
+
+
+# ----------------------------------------------------------------------
+# Core sweep
+# ----------------------------------------------------------------------
+
 def run_parameter_sweep(
     bets_df: pd.DataFrame,
     param_grid: dict[str, list[Any]],
@@ -63,6 +106,12 @@ def run_parameter_sweep(
             horizons = config.pop("horizons", ["7d"])
             sides = config.pop("sides", ["YES", "NO"])
 
+            # Pre-extract category filters for naming only
+            cat_inc = config.get("category_include")
+            cat_broad_inc = config.get("category_broad_include")
+            cat_exc = config.get("category_exclude")
+            cat_broad_exc = config.get("category_broad_exclude")
+
             # Create strategies for each price range
             for price_min, price_max in price_ranges:
                 for horizon in horizons:
@@ -73,13 +122,21 @@ def run_parameter_sweep(
                             f"{side_str}_{int(price_min*100)}-{int(price_max*100)}pct_{horizon}"
                         )
 
-                        # Add descriptive suffix for filters
-                        if "min_volume" in config:
+                        # Descriptive suffix for filters
+                        if "min_volume" in config and config["min_volume"] is not None:
                             name += f"_vol{int(config['min_volume']/1000)}k"
-                        if "category_include" in config and config["category_include"]:
-                            name += f"_cat{len(config['category_include'])}"
-                        if "category_broad_include" in config and config["category_broad_include"]:
-                            name += f"_catb{len(config['category_broad_include'])}"
+
+                        # Category includes (narrow & broad)
+                        if cat_inc:
+                            name += _format_cat_suffix("cat", cat_inc)
+                        if cat_broad_inc:
+                            name += _format_cat_suffix("catb", cat_broad_inc)
+
+                        # Category excludes (if you use them in base_config / grid)
+                        if cat_exc:
+                            name += _format_cat_suffix("catexc", cat_exc)
+                        if cat_broad_exc:
+                            name += _format_cat_suffix("catbexc", cat_broad_exc)
 
                         strategy = StrategyConfig(
                             name=name,
@@ -100,6 +157,24 @@ def run_parameter_sweep(
             if "price_min" in config and "price_max" in config:
                 name_parts.append(
                     f"{int(config['price_min']*100)}-{int(config['price_max']*100)}pct"
+                )
+
+            # Category filters in name_parts
+            if "category_include" in config and config["category_include"]:
+                name_parts.append(
+                    _format_cat_suffix("cat", config["category_include"]).lstrip("_")
+                )
+            if "category_broad_include" in config and config["category_broad_include"]:
+                name_parts.append(
+                    _format_cat_suffix("catb", config["category_broad_include"]).lstrip("_")
+                )
+            if "category_exclude" in config and config["category_exclude"]:
+                name_parts.append(
+                    _format_cat_suffix("catexc", config["category_exclude"]).lstrip("_")
+                )
+            if "category_broad_exclude" in config and config["category_broad_exclude"]:
+                name_parts.append(
+                    _format_cat_suffix("catbexc", config["category_broad_exclude"]).lstrip("_")
                 )
 
             name = "_".join(name_parts) if name_parts else f"strategy_{len(strategies)}"
@@ -130,8 +205,8 @@ def run_longshot_sweep(
     horizons: Optional[list[str]] = None,
     sides: Optional[list[str]] = None,
     volume_thresholds: Optional[list[float]] = None,
-    categories: Optional[list[list[str]]] = None,
-    categories_broad: Optional[list[list[str]]] = None,
+    categories: Optional[list[Optional[list[str]]]] = None,
+    categories_broad: Optional[list[Optional[list[str]]]] = None,
     initial_capital: float = 1000.0,
     stake_per_bet: float = 1.0,
     verbose: bool = False,
@@ -189,7 +264,6 @@ def run_longshot_sweep(
                     for cat_list in categories:
                         for cat_broad_list in categories_broad:
                             # Build strategy name
-                            # Handle "both" in naming
                             side_str = "both" if side == "both" else side.lower()
                             name_parts = [
                                 side_str,
@@ -197,18 +271,24 @@ def run_longshot_sweep(
                                 horizon,
                             ]
 
-                            config_kwargs = {}
+                            config_kwargs: dict[str, Any] = {}
 
                             if min_vol is not None:
                                 name_parts.append(f"vol{int(min_vol/1000)}k")
                                 config_kwargs["min_volume"] = min_vol
 
                             if cat_list is not None:
-                                name_parts.append(f"cat{len(cat_list)}")
+                                # cat_sports-politics
+                                suffix = _format_cat_suffix("cat", cat_list)
+                                if suffix:
+                                    name_parts.append(suffix.lstrip("_"))
                                 config_kwargs["category_include"] = cat_list
 
                             if cat_broad_list is not None:
-                                name_parts.append(f"catb{len(cat_broad_list)}")
+                                # catb_macro-crypto
+                                suffix = _format_cat_suffix("catb", cat_broad_list)
+                                if suffix:
+                                    name_parts.append(suffix.lstrip("_"))
                                 config_kwargs["category_broad_include"] = cat_broad_list
 
                             name = "_".join(name_parts)
