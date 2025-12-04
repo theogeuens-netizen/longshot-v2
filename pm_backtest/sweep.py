@@ -1,19 +1,25 @@
 """
 Parameter sweep and grid search functionality.
+
+Supports:
+- Parameter grid sweeps
+- Longshot-specific sweeps
+- Parallel execution via run_multiple_backtests
+- Checkpointing for long sweeps
 """
 
 import pandas as pd
 import itertools
-from typing import Optional, Any
+from typing import Optional, Any, List
 from .strategies import StrategyConfig, create_longshot_strategies
 from .backtest import run_multiple_backtests
 
-# ----------------------------------------------------------------------
-# Optional progress bar (tqdm)
-# ----------------------------------------------------------------------
+# Optional tqdm import
 try:
     from tqdm.auto import tqdm
-except ImportError:  # graceful fallback if tqdm is not installed
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
     def tqdm(iterable=None, total=None, **kwargs):
         return iterable
 
@@ -27,19 +33,13 @@ def _slugify(value: str) -> str:
     if value is None:
         return ""
     v = str(value).strip().lower()
-    # basic replacements
     v = v.replace("&", "and").replace("+", "plus").replace("/", "-").replace(" ", "-")
-    # keep only a–z, 0–9, '-' and '_'
     allowed = "abcdefghijklmnopqrstuvwxyz0123456789-_"
     return "".join(ch for ch in v if ch in allowed)
 
 
 def _format_cat_suffix(tag: str, cats: list[Any], max_items: int = 3) -> str:
-    """
-    Build a compact suffix like:
-      _cat_sports-politics
-      _catb_macro-crypto+2more
-    """
+    """Build a compact suffix for category filters."""
     if not cats:
         return ""
     slugs = [_slugify(c) for c in cats if c]
@@ -68,6 +68,10 @@ def run_parameter_sweep(
     stake_mode: str = "fixed",
     base_config: Optional[dict] = None,
     verbose: bool = False,
+    checkpoint_path: Optional[str] = None,
+    checkpoint_every: int = 50,
+    n_jobs: int = -1,
+    use_parallel: bool = True,
 ) -> pd.DataFrame:
     """
     Run a parameter sweep over a grid of strategy configurations.
@@ -83,7 +87,11 @@ def run_parameter_sweep(
         initial_capital: Starting capital for each backtest
         stake_mode: Staking mode
         base_config: Base configuration dict to apply to all strategies
-        verbose: If True, print detailed progress
+        verbose: If True, show progress bar
+        checkpoint_path: Path to save/resume results
+        checkpoint_every: Save checkpoint every N strategies
+        n_jobs: Number of parallel workers (-1 = all CPUs)
+        use_parallel: Whether to use parallel execution
 
     Returns:
         DataFrame with one row per strategy configuration tested
@@ -103,12 +111,10 @@ def run_parameter_sweep(
     print(f"Total combinations: {len(combinations):,}")
     print(f"{'='*60}\n")
 
-    strategies = []
+    strategies: List[StrategyConfig] = []
 
-    # progress bar over parameter combinations
-    combo_iter = tqdm(combinations, desc="Building strategies from grid", unit="cfg") if verbose else combinations
-
-    for combo in combo_iter:
+    # Build strategies from grid
+    for combo in combinations:
         config = dict(zip(param_names, combo))
         config.update(base_config)
 
@@ -118,33 +124,26 @@ def run_parameter_sweep(
             horizons = config.pop("horizons", ["7d"])
             sides = config.pop("sides", ["YES", "NO"])
 
-            # Pre-extract category filters for naming only
             cat_inc = config.get("category_include")
             cat_broad_inc = config.get("category_broad_include")
             cat_exc = config.get("category_exclude")
             cat_broad_exc = config.get("category_broad_exclude")
 
-            # Create strategies for each price range
             for price_min, price_max in price_ranges:
                 for horizon in horizons:
                     for side in sides:
-                        # Handle "both" in naming
                         side_str = "both" if side == "both" else side.lower()
                         name = (
                             f"{side_str}_{int(price_min*100)}-{int(price_max*100)}pct_{horizon}"
                         )
 
-                        # Descriptive suffix for filters
                         if "min_volume" in config and config["min_volume"] is not None:
                             name += f"_vol{int(config['min_volume']/1000)}k"
 
-                        # Category includes (narrow & broad)
                         if cat_inc:
                             name += _format_cat_suffix("cat", cat_inc)
                         if cat_broad_inc:
                             name += _format_cat_suffix("catb", cat_broad_inc)
-
-                        # Category excludes (if you use them in base_config / grid)
                         if cat_exc:
                             name += _format_cat_suffix("catexc", cat_exc)
                         if cat_broad_exc:
@@ -171,7 +170,6 @@ def run_parameter_sweep(
                     f"{int(config['price_min']*100)}-{int(config['price_max']*100)}pct"
                 )
 
-            # Category filters in name_parts
             if "category_include" in config and config["category_include"]:
                 name_parts.append(
                     _format_cat_suffix("cat", config["category_include"]).lstrip("_")
@@ -197,15 +195,19 @@ def run_parameter_sweep(
             )
             strategies.append(strategy)
 
-    print(f"Generated {len(strategies)} strategies to test\n")
+    print(f"Generated {len(strategies):,} strategies to test\n")
 
-    # Run backtests
+    # Run backtests with parallel execution
     results_df = run_multiple_backtests(
         bets_df,
         strategies,
         initial_capital=initial_capital,
         stake_mode=stake_mode,
         verbose=verbose,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        n_jobs=n_jobs,
+        use_parallel=use_parallel,
     )
 
     return results_df
@@ -222,6 +224,10 @@ def run_longshot_sweep(
     initial_capital: float = 1000.0,
     stake_per_bet: float = 1.0,
     verbose: bool = False,
+    checkpoint_path: Optional[str] = None,
+    checkpoint_every: int = 50,
+    n_jobs: int = -1,
+    use_parallel: bool = True,
 ) -> pd.DataFrame:
     """
     Convenience function to run a sweep over longshot strategy parameters.
@@ -232,23 +238,27 @@ def run_longshot_sweep(
         horizons: List of horizons to test
         sides: List of sides to test (can include "both", "YES", "NO")
         volume_thresholds: List of minimum volume thresholds to test
-        categories: List of category lists to test (e.g., [["Sports"], ["Politics"]])
-        categories_broad: List of category_broad lists to test (e.g., [["Sports"], ["Politics"]])
+        categories: List of category lists to test
+        categories_broad: List of category_broad lists to test
         initial_capital: Starting capital
         stake_per_bet: Fixed stake per bet
-        verbose: If True, print detailed progress
+        verbose: If True, show progress
+        checkpoint_path: Path to save/resume results
+        checkpoint_every: Save checkpoint every N strategies
+        n_jobs: Number of parallel workers (-1 = all CPUs)
+        use_parallel: Whether to use parallel execution
 
     Returns:
         DataFrame with backtest results for all combinations
     """
-    # Default parameters focused on longshot opportunities
+    # Default parameters
     if price_buckets is None:
         price_buckets = [
-            (0.01, 0.05),  # 1-5% (extreme longshots)
-            (0.05, 0.10),  # 5-10%
-            (0.10, 0.20),  # 10-20%
-            (0.90, 0.95),  # 90-95% (reverse longshots)
-            (0.95, 0.99),  # 95-99% (extreme reverse longshots)
+            (0.01, 0.05),
+            (0.05, 0.10),
+            (0.10, 0.20),
+            (0.90, 0.95),
+            (0.95, 0.99),
         ]
 
     if horizons is None:
@@ -266,18 +276,7 @@ def run_longshot_sweep(
     if categories_broad is None:
         categories_broad = [None]
 
-    strategies = []
-
-    # Progress bar setup
-    total_combos = (
-        len(price_buckets)
-        * len(horizons)
-        * len(sides)
-        * len(volume_thresholds)
-        * len(categories)
-        * len(categories_broad)
-    )
-    pbar = tqdm(total=total_combos, desc="Building longshot strategies", unit="cfg") if verbose else None
+    strategies: List[StrategyConfig] = []
 
     # Generate all combinations
     for price_min, price_max in price_buckets:
@@ -286,7 +285,6 @@ def run_longshot_sweep(
                 for min_vol in volume_thresholds:
                     for cat_list in categories:
                         for cat_broad_list in categories_broad:
-                            # Build strategy name
                             side_str = "both" if side == "both" else side.lower()
                             name_parts = [
                                 side_str,
@@ -301,14 +299,12 @@ def run_longshot_sweep(
                                 config_kwargs["min_volume"] = min_vol
 
                             if cat_list is not None:
-                                # cat_sports-politics
                                 suffix = _format_cat_suffix("cat", cat_list)
                                 if suffix:
                                     name_parts.append(suffix.lstrip("_"))
                                 config_kwargs["category_include"] = cat_list
 
                             if cat_broad_list is not None:
-                                # catb_macro-crypto
                                 suffix = _format_cat_suffix("catb", cat_broad_list)
                                 if suffix:
                                     name_parts.append(suffix.lstrip("_"))
@@ -327,12 +323,6 @@ def run_longshot_sweep(
                             )
                             strategies.append(strategy)
 
-                            if pbar is not None:
-                                pbar.update(1)
-
-    if pbar is not None:
-        pbar.close()
-
     print(f"\n{'='*60}")
     print(f"LONGSHOT PARAMETER SWEEP")
     print(f"{'='*60}")
@@ -342,16 +332,20 @@ def run_longshot_sweep(
     print(f"Volume thresholds: {len(volume_thresholds)}")
     print(f"Category filters: {len(categories)}")
     print(f"Category Broad filters: {len(categories_broad)}")
-    print(f"Total strategies: {len(strategies)}")
+    print(f"Total strategies: {len(strategies):,}")
     print(f"{'='*60}\n")
 
-    # Run backtests
+    # Run backtests with parallel execution
     results_df = run_multiple_backtests(
         bets_df,
         strategies,
         initial_capital=initial_capital,
         stake_mode="fixed",
         verbose=verbose,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        n_jobs=n_jobs,
+        use_parallel=use_parallel,
     )
 
     return results_df
@@ -379,18 +373,14 @@ def filter_sweep_results(
     """
     df = results_df.copy()
 
-    # Filter by minimum bets
     df = df[df["num_bets"] >= min_bets]
 
-    # Filter by Sharpe ratio
     if min_sharpe is not None:
         df = df[df["sharpe_ratio"] >= min_sharpe]
 
-    # Filter by return
     if min_return_pct is not None:
         df = df[df["total_return_pct"] >= min_return_pct]
 
-    # Filter by drawdown (remember drawdown is negative)
     if max_drawdown_pct is not None:
         df = df[df["max_drawdown_pct"] >= max_drawdown_pct]
 
@@ -412,9 +402,9 @@ def analyze_sweep_results(results_df: pd.DataFrame) -> None:
     print(f"SWEEP RESULTS ANALYSIS")
     print(f"{'='*60}\n")
 
-    print(f"Total strategies tested: {len(results_df)}")
-    print(f"Strategies with positive return: {(results_df['total_return_pct'] > 0).sum()}")
-    print(f"Strategies with Sharpe > 1: {(results_df['sharpe_ratio'] > 1).sum()}")
+    print(f"Total strategies tested: {len(results_df):,}")
+    print(f"Strategies with positive return: {(results_df['total_return_pct'] > 0).sum():,}")
+    print(f"Strategies with Sharpe > 1: {(results_df['sharpe_ratio'] > 1).sum():,}")
 
     print(f"\n📊 PERFORMANCE DISTRIBUTION")
     print(f"  Return (%):")
