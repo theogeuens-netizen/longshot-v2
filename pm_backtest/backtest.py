@@ -300,19 +300,75 @@ def run_backtest_with_lockup(
     }
 
 
+def _strategy_to_dict(strategy: StrategyConfig) -> dict:
+    """Convert StrategyConfig to a plain dict for pickling."""
+    return {
+        "name": strategy.name,
+        "sides": strategy.sides,
+        "horizons": strategy.horizons,
+        "price_min": strategy.price_min,
+        "price_max": strategy.price_max,
+        "stake_per_bet": strategy.stake_per_bet,
+        "min_volume": getattr(strategy, 'min_volume', None),
+        "max_volume": getattr(strategy, 'max_volume', None),
+        "min_liquidity": getattr(strategy, 'min_liquidity', None),
+        "max_liquidity": getattr(strategy, 'max_liquidity', None),
+        "category_include": getattr(strategy, 'category_include', None),
+        "category_exclude": getattr(strategy, 'category_exclude', None),
+        "category_broad_include": getattr(strategy, 'category_broad_include', None),
+        "category_broad_exclude": getattr(strategy, 'category_broad_exclude', None),
+        "category_field": getattr(strategy, 'category_field', 'category_1'),
+        "volume_field": getattr(strategy, 'volume_field', 'volumeNum'),
+        "liquidity_field": getattr(strategy, 'liquidity_field', 'liquidityNum'),
+        "max_bets_per_day": getattr(strategy, 'max_bets_per_day', None),
+        "start_date": getattr(strategy, 'start_date', None),
+        "end_date": getattr(strategy, 'end_date', None),
+    }
+
+
+def _dict_to_strategy(d: dict) -> StrategyConfig:
+    """Convert a plain dict back to StrategyConfig."""
+    return StrategyConfig(
+        name=d["name"],
+        sides=d["sides"],
+        horizons=d["horizons"],
+        price_min=d["price_min"],
+        price_max=d["price_max"],
+        stake_per_bet=d["stake_per_bet"],
+        min_volume=d.get("min_volume"),
+        max_volume=d.get("max_volume"),
+        min_liquidity=d.get("min_liquidity"),
+        max_liquidity=d.get("max_liquidity"),
+        category_include=d.get("category_include"),
+        category_exclude=d.get("category_exclude"),
+        category_broad_include=d.get("category_broad_include"),
+        category_broad_exclude=d.get("category_broad_exclude"),
+        category_field=d.get("category_field", "category_1"),
+        volume_field=d.get("volume_field", "volumeNum"),
+        liquidity_field=d.get("liquidity_field", "liquidityNum"),
+        max_bets_per_day=d.get("max_bets_per_day"),
+        start_date=d.get("start_date"),
+        end_date=d.get("end_date"),
+    )
+
+
 def _run_single_backtest_worker(args: tuple) -> Optional[dict]:
     """
     Worker function for parallel backtest execution.
     
     Args:
-        args: Tuple of (bets_df, strategy, initial_capital, stake_mode)
+        args: Tuple of (bets_df, strategy_dict, initial_capital, stake_mode)
+              Note: strategy_dict is a plain dict, not StrategyConfig (for pickling)
         
     Returns:
         Dictionary with strategy results, or None if no results
     """
-    bets_df, strategy, initial_capital, stake_mode = args
+    bets_df, strategy_dict, initial_capital, stake_mode = args
     
     try:
+        # Reconstruct StrategyConfig from dict in worker process
+        strategy = _dict_to_strategy(strategy_dict)
+        
         backtest_result = run_backtest(
             bets_df,
             strategy,
@@ -331,16 +387,16 @@ def _run_single_backtest_worker(args: tuple) -> Optional[dict]:
                 "price_min": strategy.price_min,
                 "price_max": strategy.price_max,
                 "stake_per_bet": strategy.stake_per_bet,
-                "min_volume": getattr(strategy, 'min_volume', None),
-                "category_include": getattr(strategy, 'category_include', None),
-                "category_broad_include": getattr(strategy, 'category_broad_include', None),
-                "category_exclude": getattr(strategy, 'category_exclude', None),
-                "category_broad_exclude": getattr(strategy, 'category_broad_exclude', None),
+                "min_volume": strategy.min_volume,
+                "category_include": strategy.category_include,
+                "category_broad_include": strategy.category_broad_include,
+                "category_exclude": strategy.category_exclude,
+                "category_broad_exclude": strategy.category_broad_exclude,
                 **metrics,
             }
     except Exception as e:
         # Log error but don't crash the whole sweep
-        print(f"⚠️  Error in strategy {strategy.name}: {e}")
+        print(f"⚠️  Error in strategy {strategy_dict.get('name', '?')}: {e}")
     
     return None
 
@@ -547,11 +603,11 @@ def _run_parallel_backtests(
     """Run backtests in parallel with progress bar and checkpointing."""
     results = existing_results.copy()
     
-    # Prepare arguments for workers
-    # Note: We need to pass bets_df to each worker, which can be memory-intensive
-    # For very large DataFrames, consider chunking or using shared memory
+    # Convert strategies to dicts to avoid pickle issues in notebooks
+    # This is necessary because ProcessPoolExecutor pickles objects to send to workers,
+    # and dataclasses can have issues when modules are reloaded in Jupyter/Colab
     work_args = [
-        (bets_df, strategy, initial_capital, stake_mode)
+        (bets_df, _strategy_to_dict(strategy), initial_capital, stake_mode)
         for strategy in strategies
     ]
 
