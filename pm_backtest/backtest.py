@@ -3,17 +3,14 @@ Backtesting engine for prediction market strategies.
 
 Supports:
 - Single strategy backtesting
-- Multiple strategy backtesting with parallel execution
+- Multiple strategy backtesting with checkpointing
 - Capital lock-up model
-- Checkpointing for long sweeps
 """
 
 import pandas as pd
 import numpy as np
 from typing import Optional, Literal, List
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
 
 # Optional tqdm import
 try:
@@ -300,131 +297,6 @@ def run_backtest_with_lockup(
     }
 
 
-# =============================================================================
-# Worker Pool with Shared DataFrame (avoids pickling DataFrame per task)
-# =============================================================================
-
-# Global variable for worker processes - initialized once per worker
-_worker_bets_df = None
-_worker_initial_capital = None
-_worker_stake_mode = None
-
-
-def _init_worker(bets_df: pd.DataFrame, initial_capital: float, stake_mode: str):
-    """
-    Initializer for worker processes.
-    
-    Called ONCE per worker when the pool starts. The DataFrame is pickled
-    only once per worker, not once per task. This is the key optimization.
-    """
-    global _worker_bets_df, _worker_initial_capital, _worker_stake_mode
-    _worker_bets_df = bets_df
-    _worker_initial_capital = initial_capital
-    _worker_stake_mode = stake_mode
-
-
-def _strategy_to_dict(strategy: StrategyConfig) -> dict:
-    """Convert StrategyConfig to a plain dict for pickling."""
-    return {
-        "name": strategy.name,
-        "sides": strategy.sides,
-        "horizons": strategy.horizons,
-        "price_min": strategy.price_min,
-        "price_max": strategy.price_max,
-        "stake_per_bet": strategy.stake_per_bet,
-        "min_volume": getattr(strategy, 'min_volume', None),
-        "max_volume": getattr(strategy, 'max_volume', None),
-        "min_liquidity": getattr(strategy, 'min_liquidity', None),
-        "max_liquidity": getattr(strategy, 'max_liquidity', None),
-        "category_include": getattr(strategy, 'category_include', None),
-        "category_exclude": getattr(strategy, 'category_exclude', None),
-        "category_broad_include": getattr(strategy, 'category_broad_include', None),
-        "category_broad_exclude": getattr(strategy, 'category_broad_exclude', None),
-        "category_field": getattr(strategy, 'category_field', 'category_1'),
-        "volume_field": getattr(strategy, 'volume_field', 'volumeNum'),
-        "liquidity_field": getattr(strategy, 'liquidity_field', 'liquidityNum'),
-        "max_bets_per_day": getattr(strategy, 'max_bets_per_day', None),
-        "start_date": getattr(strategy, 'start_date', None),
-        "end_date": getattr(strategy, 'end_date', None),
-    }
-
-
-def _dict_to_strategy(d: dict) -> StrategyConfig:
-    """Convert a plain dict back to StrategyConfig."""
-    return StrategyConfig(
-        name=d["name"],
-        sides=d["sides"],
-        horizons=d["horizons"],
-        price_min=d["price_min"],
-        price_max=d["price_max"],
-        stake_per_bet=d["stake_per_bet"],
-        min_volume=d.get("min_volume"),
-        max_volume=d.get("max_volume"),
-        min_liquidity=d.get("min_liquidity"),
-        max_liquidity=d.get("max_liquidity"),
-        category_include=d.get("category_include"),
-        category_exclude=d.get("category_exclude"),
-        category_broad_include=d.get("category_broad_include"),
-        category_broad_exclude=d.get("category_broad_exclude"),
-        category_field=d.get("category_field", "category_1"),
-        volume_field=d.get("volume_field", "volumeNum"),
-        liquidity_field=d.get("liquidity_field", "liquidityNum"),
-        max_bets_per_day=d.get("max_bets_per_day"),
-        start_date=d.get("start_date"),
-        end_date=d.get("end_date"),
-    )
-
-
-def _run_single_backtest_worker(strategy_dict: dict) -> Optional[dict]:
-    """
-    Worker function for parallel backtest execution.
-    
-    Uses global _worker_bets_df initialized by _init_worker().
-    Only the strategy_dict is passed per task (small, fast to pickle).
-    
-    Args:
-        strategy_dict: Plain dict representation of StrategyConfig
-        
-    Returns:
-        Dictionary with strategy results, or None if no results
-    """
-    global _worker_bets_df, _worker_initial_capital, _worker_stake_mode
-    
-    try:
-        # Reconstruct StrategyConfig from dict
-        strategy = _dict_to_strategy(strategy_dict)
-        
-        backtest_result = run_backtest(
-            _worker_bets_df,
-            strategy,
-            initial_capital=_worker_initial_capital,
-            stake_mode=_worker_stake_mode,
-            verbose=False,
-        )
-        
-        metrics = backtest_result["metrics"]
-        
-        if metrics:
-            return {
-                "strategy_name": strategy.name,
-                "sides": ",".join(strategy.sides),
-                "horizons": ",".join(strategy.horizons),
-                "price_min": strategy.price_min,
-                "price_max": strategy.price_max,
-                "stake_per_bet": strategy.stake_per_bet,
-                "min_volume": strategy.min_volume,
-                "category_include": strategy.category_include,
-                "category_broad_include": strategy.category_broad_include,
-                "category_exclude": strategy.category_exclude,
-                "category_broad_exclude": strategy.category_broad_exclude,
-                **metrics,
-            }
-    except Exception as e:
-        print(f"⚠️  Error in strategy {strategy_dict.get('name', '?')}: {e}")
-    
-    return None
-
-
 def run_multiple_backtests(
     bets_df: pd.DataFrame,
     strategies: List[StrategyConfig],
@@ -433,22 +305,19 @@ def run_multiple_backtests(
     verbose: bool = False,
     checkpoint_path: Optional[str] = None,
     checkpoint_every: int = 50,
-    n_jobs: int = -1,
-    use_parallel: bool = True,
+    **kwargs,  # Accept but ignore parallel args for compatibility
 ) -> pd.DataFrame:
     """
-    Run backtests for multiple strategies with parallel execution and checkpointing.
+    Run backtests for multiple strategies with checkpointing.
 
     Args:
         bets_df: Full bets DataFrame
         strategies: List of strategy configurations
         initial_capital: Starting capital for each backtest
         stake_mode: Staking mode
-        verbose: If True, show progress bar (individual backtest prints are suppressed)
-        checkpoint_path: Optional path to a parquet file for saving/resuming results
-        checkpoint_every: Save checkpoint every N strategies (default: 50)
-        n_jobs: Number of parallel workers. -1 = use all CPUs, 1 = sequential
-        use_parallel: Whether to use parallel execution (default: True)
+        verbose: If True, show progress bar
+        checkpoint_path: Optional path to save/resume results
+        checkpoint_every: Save checkpoint every N strategies
 
     Returns:
         DataFrame with one row per strategy, containing metrics
@@ -456,24 +325,7 @@ def run_multiple_backtests(
     results: List[dict] = []
     start_index = 0
 
-    # Determine number of workers
-    # Determine number of workers
-    # For ProcessPoolExecutor with initializer, use CPU count for optimal parallelism
-    if n_jobs == -1:
-        n_workers = mp.cpu_count()
-    elif n_jobs <= 0:
-        n_workers = max(1, mp.cpu_count() + n_jobs)
-    else:
-        n_workers = n_jobs
-    
-    # Disable parallel for very small sweeps (overhead not worth it)
-    if len(strategies) < 20 or not use_parallel or n_workers == 1:
-        use_parallel = False
-        n_workers = 1
-
-    # --------------------------------------------------
     # Resume from checkpoint if available
-    # --------------------------------------------------
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         try:
             checkpoint_df = pd.read_parquet(checkpoint_path)
@@ -491,84 +343,22 @@ def run_multiple_backtests(
         print("✓ All strategies already completed!")
         return pd.DataFrame(results)
 
-    # --------------------------------------------------
-    # Run backtests
-    # --------------------------------------------------
     print(f"\n{'='*60}")
     print(f"RUNNING BACKTESTS")
     print(f"{'='*60}")
     print(f"  Total strategies: {len(strategies):,}")
     print(f"  Remaining: {len(remaining_strategies):,}")
-    print(f"  Mode: {'Parallel' if use_parallel else 'Sequential'} ({n_workers} workers)")
     print(f"  Checkpoint: {'Enabled' if checkpoint_path else 'Disabled'} (every {checkpoint_every})")
     print(f"{'='*60}\n")
 
-    if use_parallel:
-        results = _run_parallel_backtests(
-            bets_df=bets_df,
-            strategies=remaining_strategies,
-            initial_capital=initial_capital,
-            stake_mode=stake_mode,
-            existing_results=results,
-            checkpoint_path=checkpoint_path,
-            checkpoint_every=checkpoint_every,
-            n_workers=n_workers,
-            start_index=start_index,
-            total_strategies=len(strategies),
-        )
-    else:
-        results = _run_sequential_backtests(
-            bets_df=bets_df,
-            strategies=remaining_strategies,
-            initial_capital=initial_capital,
-            stake_mode=stake_mode,
-            existing_results=results,
-            checkpoint_path=checkpoint_path,
-            checkpoint_every=checkpoint_every,
-            start_index=start_index,
-            total_strategies=len(strategies),
-        )
-
-    if len(results) == 0:
-        print("⚠️  No strategies produced results")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(results)
-
-    # Sort by total return descending
-    df = df.sort_values("total_return_pct", ascending=False).reset_index(drop=True)
-
-    # Final checkpoint save
-    if checkpoint_path is not None:
-        df.to_parquet(checkpoint_path, index=False)
-        print(f"\n✓ Final results saved to {checkpoint_path}")
-
-    return df
-
-
-def _run_sequential_backtests(
-    bets_df: pd.DataFrame,
-    strategies: List[StrategyConfig],
-    initial_capital: float,
-    stake_mode: str,
-    existing_results: List[dict],
-    checkpoint_path: Optional[str],
-    checkpoint_every: int,
-    start_index: int,
-    total_strategies: int,
-) -> List[dict]:
-    """Run backtests sequentially with progress bar."""
-    results = existing_results.copy()
-    
     # Progress bar
     pbar = tqdm(
-        strategies,
-        total=len(strategies),
+        remaining_strategies,
+        total=len(remaining_strategies),
         desc="Backtesting",
         unit="strat",
-        initial=0,
         ncols=100,
-    ) if TQDM_AVAILABLE else strategies
+    ) if TQDM_AVAILABLE else remaining_strategies
 
     for i, strategy in enumerate(pbar):
         actual_index = start_index + i
@@ -600,10 +390,10 @@ def _run_sequential_backtests(
             }
             results.append(result_row)
 
-        # Update progress bar description
+        # Update progress bar
         if TQDM_AVAILABLE and hasattr(pbar, 'set_postfix'):
             pbar.set_postfix({
-                'done': f"{actual_index + 1}/{total_strategies}",
+                'done': f"{actual_index + 1}/{len(strategies)}",
                 'results': len(results),
             })
 
@@ -611,107 +401,19 @@ def _run_sequential_backtests(
         if checkpoint_path is not None and (actual_index + 1) % checkpoint_every == 0:
             pd.DataFrame(results).to_parquet(checkpoint_path, index=False)
 
-    return results
+    if len(results) == 0:
+        print("⚠️  No strategies produced results")
+        return pd.DataFrame()
 
+    df = pd.DataFrame(results)
+    df = df.sort_values("total_return_pct", ascending=False).reset_index(drop=True)
 
-def _run_parallel_backtests(
-    bets_df: pd.DataFrame,
-    strategies: List[StrategyConfig],
-    initial_capital: float,
-    stake_mode: str,
-    existing_results: List[dict],
-    checkpoint_path: Optional[str],
-    checkpoint_every: int,
-    n_workers: int,
-    start_index: int,
-    total_strategies: int,
-) -> List[dict]:
-    """
-    Run backtests in parallel using ThreadPoolExecutor.
-    
-    We use ThreadPoolExecutor instead of ProcessPoolExecutor because:
-    - ProcessPoolExecutor hangs in Jupyter/Colab environments
-    - ThreadPoolExecutor shares memory (no pickle overhead)
-    - Pandas releases the GIL for most operations, so we still get parallelism
-    """
-    from concurrent.futures import ThreadPoolExecutor
-    
-    results = existing_results.copy()
+    # Final checkpoint save
+    if checkpoint_path is not None:
+        df.to_parquet(checkpoint_path, index=False)
+        print(f"\n✓ Final results saved to {checkpoint_path}")
 
-    # Progress bar
-    pbar = tqdm(
-        total=len(strategies),
-        desc=f"Backtesting ({n_workers} threads)",
-        unit="strat",
-        ncols=100,
-    ) if TQDM_AVAILABLE else None
-
-    completed = 0
-    
-    def run_single(strategy: StrategyConfig) -> Optional[dict]:
-        """Run a single backtest."""
-        try:
-            result = run_backtest(
-                bets_df,
-                strategy,
-                initial_capital=initial_capital,
-                stake_mode=stake_mode,
-                verbose=False,
-            )
-            
-            metrics = result["metrics"]
-            if metrics:
-                return {
-                    "strategy_name": strategy.name,
-                    "sides": ",".join(strategy.sides),
-                    "horizons": ",".join(strategy.horizons),
-                    "price_min": strategy.price_min,
-                    "price_max": strategy.price_max,
-                    "stake_per_bet": strategy.stake_per_bet,
-                    "min_volume": strategy.min_volume,
-                    "category_include": strategy.category_include,
-                    "category_broad_include": strategy.category_broad_include,
-                    "category_exclude": strategy.category_exclude,
-                    "category_broad_exclude": strategy.category_broad_exclude,
-                    **metrics,
-                }
-        except Exception as e:
-            print(f"⚠️  Error in {strategy.name}: {e}")
-        return None
-
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        future_to_idx = {
-            executor.submit(run_single, s): i for i, s in enumerate(strategies)
-        }
-        
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            actual_index = start_index + completed
-            
-            try:
-                result = future.result(timeout=60)  # 60s timeout per strategy
-                if result is not None:
-                    results.append(result)
-            except Exception as e:
-                print(f"⚠️  Strategy {idx} failed: {e}")
-            
-            completed += 1
-            
-            if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix({
-                    'done': f"{actual_index + 1}/{total_strategies}",
-                    'results': len(results),
-                })
-            
-            # Checkpoint
-            if checkpoint_path is not None and completed % checkpoint_every == 0:
-                pd.DataFrame(results).to_parquet(checkpoint_path, index=False)
-
-    if pbar is not None:
-        pbar.close()
-
-    return results
+    return df
 
 
 def run_multiple_backtests_chunked(
@@ -721,7 +423,6 @@ def run_multiple_backtests_chunked(
     stake_mode: Literal["fixed"] = "fixed",
     chunk_size: int = 100,
     checkpoint_path: Optional[str] = None,
-    n_jobs: int = -1,
 ) -> pd.DataFrame:
     """
     Run backtests in chunks with automatic checkpointing.
@@ -735,7 +436,6 @@ def run_multiple_backtests_chunked(
         stake_mode: Staking mode
         chunk_size: Number of strategies per chunk
         checkpoint_path: Path to save results
-        n_jobs: Number of parallel workers
         
     Returns:
         DataFrame with results
@@ -770,7 +470,6 @@ def run_multiple_backtests_chunked(
             stake_mode=stake_mode,
             verbose=True,
             checkpoint_path=None,  # We handle checkpointing here
-            n_jobs=n_jobs,
         )
         
         all_results.extend(chunk_results.to_dict("records"))
