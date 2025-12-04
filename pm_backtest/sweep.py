@@ -8,6 +8,15 @@ from typing import Optional, Any
 from .strategies import StrategyConfig, create_longshot_strategies
 from .backtest import run_multiple_backtests
 
+# ----------------------------------------------------------------------
+# Optional progress bar (tqdm)
+# ----------------------------------------------------------------------
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # graceful fallback if tqdm is not installed
+    def tqdm(iterable=None, total=None, **kwargs):
+        return iterable
+
 
 # ----------------------------------------------------------------------
 # Helpers for naming
@@ -96,7 +105,10 @@ def run_parameter_sweep(
 
     strategies = []
 
-    for combo in combinations:
+    # progress bar over parameter combinations
+    combo_iter = tqdm(combinations, desc="Building strategies from grid", unit="cfg") if verbose else combinations
+
+    for combo in combo_iter:
         config = dict(zip(param_names, combo))
         config.update(base_config)
 
@@ -256,6 +268,17 @@ def run_longshot_sweep(
 
     strategies = []
 
+    # Progress bar setup
+    total_combos = (
+        len(price_buckets)
+        * len(horizons)
+        * len(sides)
+        * len(volume_thresholds)
+        * len(categories)
+        * len(categories_broad)
+    )
+    pbar = tqdm(total=total_combos, desc="Building longshot strategies", unit="cfg") if verbose else None
+
     # Generate all combinations
     for price_min, price_max in price_buckets:
         for horizon in horizons:
@@ -303,6 +326,12 @@ def run_longshot_sweep(
                                 **config_kwargs,
                             )
                             strategies.append(strategy)
+
+                            if pbar is not None:
+                                pbar.update(1)
+
+    if pbar is not None:
+        pbar.close()
 
     print(f"\n{'='*60}")
     print(f"LONGSHOT PARAMETER SWEEP")
