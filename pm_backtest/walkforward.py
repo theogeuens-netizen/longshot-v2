@@ -295,6 +295,15 @@ def run_walk_forward_sweep(
     Args:
         bets_df: Full bets DataFrame
         param_grid: Parameter grid for sweep
+            Can include e.g.:
+              - 'price_ranges'
+              - 'horizons'
+              - 'sides'
+              - 'min_volume'
+              - 'category_include'
+              - 'category_broad_include'
+              - 'category_exclude'
+              - 'category_broad_exclude'
         config: Walk-forward configuration (includes initial_capital, stake_per_bet, use_lockup, start_date, end_date)
 
     Returns:
@@ -356,7 +365,6 @@ def run_walk_forward_sweep(
         ]
 
         # Run parameter sweep on in-sample
-        # Modify param_grid to include stake_per_bet
         base_config = {"stake_per_bet": config.stake_per_bet}
 
         sweep_results = run_parameter_sweep(
@@ -380,8 +388,7 @@ def run_walk_forward_sweep(
         best_row = sweep_results.loc[best_idx]
         best_strategy_name = best_row["strategy_name"]
 
-        # Reconstruct best strategy config
-        # Extract parameters from the best strategy
+        # Reconstruct best strategy config: CORE params
         best_params = {
             "sides": best_row["sides"].split(","),
             "horizons": best_row["horizons"].split(","),
@@ -390,7 +397,20 @@ def run_walk_forward_sweep(
             "stake_per_bet": best_row["stake_per_bet"],
         }
 
-        # Record parameter selection
+        # OPTIONAL FILTERS (including categories)  -------------------------
+        optional_fields = [
+            "min_volume",
+            "category_include",
+            "category_broad_include",
+            "category_exclude",
+            "category_broad_exclude",
+        ]
+        for field in optional_fields:
+            if field in sweep_results.columns:
+                # best_row[field] might be None / NaN; just pass it through
+                best_params[field] = best_row[field]
+
+        # Record parameter selection (for stability analysis)
         param_selections.append(best_params)
 
         # Create strategy config for out-of-sample testing
@@ -401,6 +421,11 @@ def run_walk_forward_sweep(
             price_min=best_params["price_min"],
             price_max=best_params["price_max"],
             stake_per_bet=best_params["stake_per_bet"],
+            min_volume=best_params.get("min_volume"),
+            category_include=best_params.get("category_include"),
+            category_broad_include=best_params.get("category_broad_include"),
+            category_exclude=best_params.get("category_exclude"),
+            category_broad_exclude=best_params.get("category_broad_exclude"),
         )
 
         # Test on out-of-sample
@@ -495,6 +520,9 @@ def _analyze_param_stability(param_selections: list[dict]) -> dict:
     side_counts = {}
     horizon_counts = {}
     price_range_counts = {}
+    volume_counts = {}
+    cat_include_counts = {}
+    cat_broad_include_counts = {}
 
     for params in param_selections:
         # Count sides
@@ -509,11 +537,34 @@ def _analyze_param_stability(param_selections: list[dict]) -> dict:
         price_key = f"{params['price_min']:.2f}-{params['price_max']:.2f}"
         price_range_counts[price_key] = price_range_counts.get(price_key, 0) + 1
 
+        # Count volume thresholds (if any)
+        if "min_volume" in params and params["min_volume"] not in (None, np.nan):
+            vol_key = int(params["min_volume"])
+            volume_counts[vol_key] = volume_counts.get(vol_key, 0) + 1
+
+        # Count category includes (if any)
+        if "category_include" in params and params["category_include"]:
+            vals = params["category_include"]
+            if not isinstance(vals, (list, tuple)):
+                vals = [vals]
+            cat_key = ",".join(sorted(map(str, vals)))
+            cat_include_counts[cat_key] = cat_include_counts.get(cat_key, 0) + 1
+
+        if "category_broad_include" in params and params["category_broad_include"]:
+            vals = params["category_broad_include"]
+            if not isinstance(vals, (list, tuple)):
+                vals = [vals]
+            catb_key = ",".join(sorted(map(str, vals)))
+            cat_broad_include_counts[catb_key] = cat_broad_include_counts.get(catb_key, 0) + 1
+
     return {
         "total_windows": len(param_selections),
         "side_counts": side_counts,
         "horizon_counts": horizon_counts,
         "price_range_counts": price_range_counts,
+        "volume_counts": volume_counts,
+        "cat_include_counts": cat_include_counts,
+        "cat_broad_include_counts": cat_broad_include_counts,
     }
 
 
@@ -560,8 +611,9 @@ def analyze_walk_forward(results: dict) -> None:
         print(f"  Out-of-Sample Return (avg): {df['oos_return_pct'].mean():>8.2f}%")
         print(f"  Degradation:                {df['is_return_pct'].mean() - df['oos_return_pct'].mean():>8.2f}%")
 
-        print(f"\n  In-Sample Sharpe (avg):     {df['is_sharpe'].mean():>8.2f}")
-        print(f"  Out-of-Sample Sharpe (avg): {df['oos_sharpe'].mean():>8.2f}")
+        if "is_sharpe" in df.columns and "oos_sharpe" in df.columns:
+            print(f"\n  In-Sample Sharpe (avg):     {df['is_sharpe'].mean():>8.2f}")
+            print(f"  Out-of-Sample Sharpe (avg): {df['oos_sharpe'].mean():>8.2f}")
 
     # Aggregated out-of-sample performance
     if aggregated_metrics:
@@ -583,16 +635,34 @@ def analyze_walk_forward(results: dict) -> None:
         print(f"\n  Side Selections:")
         for side, count in sorted(param_stability.get("side_counts", {}).items(), key=lambda x: -x[1]):
             pct = count / param_stability["total_windows"] * 100
-            print(f"    {side:<20} {count:>3} ({pct:>5.1f}%)")
+            print(f"    {side:<30} {count:>3} ({pct:>5.1f}%)")
 
         print(f"\n  Horizon Selections:")
         for horizon, count in sorted(param_stability.get("horizon_counts", {}).items(), key=lambda x: -x[1]):
             pct = count / param_stability["total_windows"] * 100
-            print(f"    {horizon:<20} {count:>3} ({pct:>5.1f}%)")
+            print(f"    {horizon:<30} {count:>3} ({pct:>5.1f}%)")
 
         print(f"\n  Price Range Selections:")
         for price_range, count in sorted(param_stability.get("price_range_counts", {}).items(), key=lambda x: -x[1]):
             pct = count / param_stability["total_windows"] * 100
-            print(f"    {price_range:<20} {count:>3} ({pct:>5.1f}%)")
+            print(f"    {price_range:<30} {count:>3} ({pct:>5.1f}%)")
+
+        if param_stability.get("volume_counts"):
+            print(f"\n  Volume Threshold Selections:")
+            for vol, count in sorted(param_stability["volume_counts"].items(), key=lambda x: -x[1]):
+                pct = count / param_stability["total_windows"] * 100
+                print(f"    min_vol={vol:<10} {count:>3} ({pct:>5.1f}%)")
+
+        if param_stability.get("cat_include_counts"):
+            print(f"\n  Category Include Selections:")
+            for cats, count in sorted(param_stability["cat_include_counts"].items(), key=lambda x: -x[1]):
+                pct = count / param_stability["total_windows"] * 100
+                print(f"    {cats:<30} {count:>3} ({pct:>5.1f}%)")
+
+        if param_stability.get("cat_broad_include_counts"):
+            print(f"\n  Category Broad Include Selections:")
+            for cats, count in sorted(param_stability["cat_broad_include_counts"].items(), key=lambda x: -x[1]):
+                pct = count / param_stability["total_windows"] * 100
+                print(f"    {cats:<30} {count:>3} ({pct:>5.1f}%)")
 
     print(f"\n{'='*80}\n")
