@@ -5,6 +5,9 @@ Backtesting engine for prediction market strategies.
 import pandas as pd
 import numpy as np
 from typing import Optional, Literal
+import os
+from tqdm.auto import tqdm
+
 from .strategies import StrategyConfig, select_bets_for_strategy
 from .metrics import calculate_metrics, format_metrics
 
@@ -287,32 +290,63 @@ def run_multiple_backtests(
     initial_capital: float = 1000.0,
     stake_mode: Literal["fixed"] = "fixed",
     verbose: bool = False,
+    checkpoint_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Run backtests for multiple strategies and return a summary DataFrame.
+
+    Adds:
+        - tqdm progress bar
+        - optional checkpointing (parquet) so you can resume long sweeps
 
     Args:
         bets_df: Full bets DataFrame
         strategies: List of strategy configurations
         initial_capital: Starting capital for each backtest
         stake_mode: Staking mode
-        verbose: If True, print progress for each strategy
+        verbose: If True, print full backtest summaries (from run_backtest)
+        checkpoint_path: Optional path to a parquet file used to save / resume results
 
     Returns:
         DataFrame with one row per strategy, containing metrics
     """
-    results = []
+    results: list[dict] = []
+    start_index = 0
 
-    for i, strategy in enumerate(strategies):
-        if not verbose:
-            print(f"Running backtest {i+1}/{len(strategies)}: {strategy.name}", end="\r")
+    # --------------------------------------------------
+    # Resume from checkpoint if available
+    # --------------------------------------------------
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        try:
+            checkpoint_df = pd.read_parquet(checkpoint_path)
+            results = checkpoint_df.to_dict("records")
+            start_index = len(results)
+            print(f"Resuming from checkpoint '{checkpoint_path}': {start_index} strategies already completed")
+        except Exception as e:
+            print(f"⚠️  Could not load checkpoint from {checkpoint_path}: {e}")
+            results = []
+            start_index = 0
+
+    # --------------------------------------------------
+    # Progress bar over strategies
+    # --------------------------------------------------
+    iterator = tqdm(
+        range(start_index, len(strategies)),
+        total=len(strategies),
+        initial=start_index,
+        desc="Backtesting strategies",
+        unit="strat",
+    )
+
+    for i in iterator:
+        strategy = strategies[i]
 
         backtest_result = run_backtest(
             bets_df,
             strategy,
             initial_capital=initial_capital,
             stake_mode=stake_mode,
-            verbose=verbose,
+            verbose=verbose,   # controls per-strategy printing
         )
 
         metrics = backtest_result["metrics"]
@@ -330,8 +364,9 @@ def run_multiple_backtests(
             }
             results.append(result_row)
 
-    if not verbose:
-        print()  # New line after progress
+        # Save checkpoint every 25 strategies or at the very end
+        if checkpoint_path is not None and ((i + 1) % 25 == 0 or i == len(strategies) - 1):
+            pd.DataFrame(results).to_parquet(checkpoint_path, index=False)
 
     if len(results) == 0:
         print("⚠️  No strategies produced results")
